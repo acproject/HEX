@@ -8,9 +8,9 @@ import os
 
 # MUSK模型路径配置
 # 选项1: 使用HuggingFace Hub自动下载（需要登录）
-MUSK_CKPT_PATH = "hf_hub:xiangjx/musk"
+# MUSK_CKPT_PATH = "hf_hub:xiangjx/musk"
 # 选项2: 使用本地路径（将模型下载后放到此处）
-# MUSK_CKPT_PATH = "/home/acproject/workspace/python_projects/HEX/models/musk_model.safetensors"
+MUSK_CKPT_PATH = "/home/acproject/workspace/python_projects/HEX/models/musk/model.safetensors"
 
 class CustomModel(nn.Module):
     def __init__(self, visual_output_dim, num_outputs, ckpt_path=None):

@@ -65,19 +65,26 @@ def load_model(checkpoint_path):
         sd = torch.load(checkpoint_path, map_location='cpu')
         incompat = model.load_state_dict(sd, strict=False)
         print(f"[load_state_dict] missing_keys={len(incompat.missing_keys)} unexpected_keys={len(incompat.unexpected_keys)}")
-        model = nn.DataParallel(model).cuda()
+        # 使用CPU模式测试（V100 CC 7.0 与当前PyTorch不兼容）
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        # 检测是否为 V100 (CC 7.0)，如果是则使用CPU
+        if torch.cuda.is_available():
+            cap = torch.cuda.get_device_capability(0)
+            if cap[0] < 7.5:  # V100 is CC 7.0
+                print(f"GPU CC {cap[0]}.{cap[1]} 不兼容，使用CPU模式")
+                device = 'cpu'
+        model = model.to(device)
         model.eval()
-        return model
+        return model, device
     except Exception as e:
         print(f"Error loading model: {e}")
         raise
 
 def main():
-    device='cuda'
     save_dir = ""
     # Load the model
     checkpoint_path = join(save_dir, 'checkpoint.pth')# replace with your checkpoint path or the provided demo checkpoint (pipeline-only, not the paper-trained checkpoints)
-    model = load_model(checkpoint_path)
+    model, device = load_model(checkpoint_path)
 
     # Prepare the dataset
     data_dir = "./sample_data/"
@@ -113,18 +120,19 @@ def main():
         transforms.Normalize(mean=IMAGENET_INCEPTION_MEAN, std=IMAGENET_INCEPTION_STD)
     ])
     dataset = PatchDataset(all_patches, label_columns, transform)
-    dataloader = DataLoader(dataset, batch_size=128, shuffle=False, num_workers=16, pin_memory=True)
+    dataloader = DataLoader(dataset, batch_size=128, shuffle=False, num_workers=4, pin_memory=(device=='cuda'))
 
     # Perform inference
     all_preds = []
     all_labels = []
     all_image_paths = []
-    print("Starting inference...")
+    print(f"Starting inference on {device}...")
 
-    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.float16):
+    autocast_device = device if device == 'cuda' else 'cpu'
+    with torch.no_grad(), torch.autocast(device_type=autocast_device, dtype=torch.float16, enabled=(device=='cuda')):
         val_loop = tqdm(enumerate(dataloader), total=len(dataloader))
         for i, data in val_loop:
-            inputs, labels = data[0].to(device,non_blocking=True), data[1].to(torch.float32)
+            inputs, labels = data[0].to(device), data[1].to(torch.float32)
             image_paths = data[2]
             outputs,_ = model(inputs)
             all_preds.extend(outputs.detach().cpu().numpy())
