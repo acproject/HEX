@@ -11,7 +11,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'hex'))
 import torch
 import numpy as np
 from PIL import Image
-from flask import Flask, render_template, request, jsonify, send_from_directory
+from flask import Flask, render_template, request, jsonify, send_from_directory, make_response
 from pathlib import Path
 import base64
 from io import BytesIO
@@ -19,6 +19,8 @@ import json
 import cv2
 import colorsys
 import threading
+import tempfile
+import uuid
 
 # MUSK/HEX相关导入
 from musk import utils, modeling
@@ -27,11 +29,15 @@ import torchvision.transforms as transforms
 from hex_architecture import CustomModel
 
 app = Flask(__name__)
+app.config["TEMPLATES_AUTO_RELOAD"] = True
+app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
 
 # 全局变量存储模型
 model = None
 device = None
 MODEL_LOAD_LOCK = threading.Lock()
+_VIRTUAL_W = None
+_VIRTUAL_B = None
 
 # 生物标志物名称
 BIOMARKER_NAMES = {
@@ -130,12 +136,40 @@ def image_to_base64(img):
     return base64.b64encode(buffered.getvalue()).decode('utf-8')
 
 
+def _rgb_black_to_transparent_rgba(img_rgb: Image.Image, alpha_floor: float = 0.0, alpha_gamma: float = 1.0) -> Image.Image:
+    arr = np.asarray(img_rgb.convert("RGB"), dtype=np.uint8)
+    intensity = np.max(arr, axis=2).astype(np.float32) / 255.0
+    intensity = np.clip(intensity, 0.0, 1.0)
+    if alpha_gamma != 1.0:
+        intensity = np.power(intensity, float(alpha_gamma))
+
+    alpha_floor = float(np.clip(alpha_floor, 0.0, 1.0))
+    alpha = intensity
+    if alpha_floor > 0.0:
+        alpha = np.maximum(alpha, alpha_floor)
+    alpha_u8 = (np.clip(alpha, 0.0, 1.0) * 255.0).astype(np.uint8)
+
+    rgba = np.zeros((arr.shape[0], arr.shape[1], 4), dtype=np.uint8)
+    rgba[:, :, :3] = arr
+    rgba[:, :, 3] = alpha_u8
+    return Image.fromarray(rgba, "RGBA")
+
+
 def _compute_tissue_mask(img, white_thresh: float = 0.92):
-    arr = np.asarray(img, dtype=np.float32) / 255.0
-    if arr.ndim != 3 or arr.shape[2] != 3:
+    import scipy.ndimage as ndimage
+
+    arr_u8 = np.asarray(img, dtype=np.uint8)
+    if arr_u8.ndim != 3 or arr_u8.shape[2] != 3:
         return None
-    gray = (arr[:, :, 0] + arr[:, :, 1] + arr[:, :, 2]) / 3.0
-    return gray < white_thresh
+
+    hsv = cv2.cvtColor(arr_u8, cv2.COLOR_RGB2HSV)
+    s = hsv[:, :, 1].astype(np.float32) / 255.0
+    v = hsv[:, :, 2].astype(np.float32) / 255.0
+
+    mask = ((v < white_thresh) & (s > 0.04)) | (v < 0.85)
+    mask = ndimage.binary_closing(mask, structure=np.ones((5, 5), dtype=bool))
+    mask = ndimage.binary_fill_holes(mask)
+    return mask
 
 
 def extract_features(img_tensor):
@@ -176,25 +210,24 @@ def generate_virtual_proteomics(features):
     这里使用简化的线性映射作为演示
     实际应用中需要加载训练好的HEX模型
     """
-    # 模拟40个生物标志物的表达值（0-1范围）
-    # 实际应用中应该使用训练好的回归头
-    np.random.seed(42)  # 为了可重复性
-    
-    # 基于特征生成伪表达值
-    feature_mean = np.mean(features)
-    feature_std = np.std(features)
-    
-    # 生成模拟的生物标志物表达
-    predictions = {}
-    for i, name in BIOMARKER_NAMES.items():
-        # 使用特征统计量生成伪表达值
-        value = np.clip(0.5 + 0.3 * np.sin(i * 0.5) + 0.1 * (feature_mean - 0.5), 0, 1)
-        # 添加一些基于特征的变化
-        value += 0.1 * np.tanh(feature_std * 2)
-        value = np.clip(value, 0, 1)
-        predictions[name] = float(value)
-    
-    return predictions
+    global _VIRTUAL_W, _VIRTUAL_B
+    x = np.asarray(features, dtype=np.float32)
+    if x.ndim == 1:
+        x = x[None, :]
+    x = x.reshape(x.shape[0], -1)
+    x = np.tanh(x)
+
+    in_dim = x.shape[1]
+    out_dim = 40
+    if _VIRTUAL_W is None or _VIRTUAL_W.shape[0] != in_dim:
+        rng = np.random.RandomState(42)
+        _VIRTUAL_W = rng.normal(0.0, 1.0 / np.sqrt(max(1, in_dim)), size=(in_dim, out_dim)).astype(np.float32)
+        _VIRTUAL_B = rng.normal(0.0, 0.05, size=(out_dim,)).astype(np.float32)
+
+    logits = x @ _VIRTUAL_W + _VIRTUAL_B
+    probs = 1.0 / (1.0 + np.exp(-logits))
+    probs = np.clip(probs[0], 0.0, 1.0)
+    return {BIOMARKER_NAMES[i]: float(probs[i - 1]) for i in range(1, 41)}
 
 
 def generate_attention_map(img_tensor, features):
@@ -240,12 +273,20 @@ def index():
                 'path': str(f)
             })
     
-    return render_template('index.html', sample_images=sample_images)
+    resp = make_response(render_template('index.html', sample_images=sample_images))
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
 
 
 @app.route('/static/<path:filename>')
 def serve_static(filename):
-    return send_from_directory('static', filename)
+    resp = make_response(send_from_directory('static', filename))
+    resp.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
 
 
 @app.route('/analyze', methods=['POST'])
@@ -284,11 +325,18 @@ def analyze():
         transform = get_transform()
         img_tensor = transform(img).unsqueeze(0)
 
+        with torch.no_grad():
+            out = model(img_tensor.to(device))
+        if isinstance(out, (tuple, list)):
+            preds = out[0]
+        else:
+            preds = out
+        preds = preds[0].detach().cpu().numpy().astype(np.float32, copy=False)
+        preds = np.clip(preds, 0.0, 1.0)
+        predictions = {BIOMARKER_NAMES[i]: float(preds[i - 1]) for i in range(1, 41)}
+
         # 提取特征
         features = extract_features(img_tensor)
-
-        # 生成虚拟蛋白质组学预测
-        predictions = generate_virtual_proteomics(features)
         
         # 生成缩略图
         thumbnail = img.copy()
@@ -353,7 +401,15 @@ def batch_analyze():
                 img_tensor = transform(img).unsqueeze(0)
                 
                 features = extract_features(img_tensor)
-                predictions = generate_virtual_proteomics(features)
+                with torch.no_grad():
+                    out = model(img_tensor.to(device))
+                if isinstance(out, (tuple, list)):
+                    preds = out[0]
+                else:
+                    preds = out
+                preds = preds[0].detach().cpu().numpy().astype(np.float32, copy=False)
+                preds = np.clip(preds, 0.0, 1.0)
+                predictions = {BIOMARKER_NAMES[i]: float(preds[i - 1]) for i in range(1, 41)}
                 
                 thumbnail = img.copy()
                 thumbnail.thumbnail((200, 200))
@@ -641,11 +697,13 @@ def predict_spatial_distribution(img, patch_size=224, stride=112):
 def _is_background_patch(pil_img, white_thresh: float) -> bool:
     if white_thresh >= 1.0:
         return False
-    arr = np.asarray(pil_img, dtype=np.float32) / 255.0
-    if arr.ndim != 3 or arr.shape[2] != 3:
+    arr_u8 = np.asarray(pil_img, dtype=np.uint8)
+    if arr_u8.ndim != 3 or arr_u8.shape[2] != 3:
         return False
-    gray = (arr[:, :, 0] + arr[:, :, 1] + arr[:, :, 2]) / 3.0
-    return float(gray.mean()) >= white_thresh
+    hsv = cv2.cvtColor(arr_u8, cv2.COLOR_RGB2HSV)
+    s = hsv[:, :, 1].astype(np.float32) / 255.0
+    v = hsv[:, :, 2].astype(np.float32) / 255.0
+    return (float(v.mean()) >= white_thresh) and (float(s.mean()) <= 0.05)
 
 
 def predict_spatial_distribution_hex(
@@ -665,14 +723,20 @@ def predict_spatial_distribution_hex(
     marker_to_idx = {BIOMARKER_NAMES[i]: i - 1 for i in range(1, 41)}
 
     if width <= patch_size:
-        patches_x = 1
+        xs = [0]
     else:
-        patches_x = (width - patch_size + stride - 1) // stride + 1
+        xs = list(range(0, width - patch_size + 1, stride))
+        last = width - patch_size
+        if xs[-1] != last:
+            xs.append(last)
 
     if height <= patch_size:
-        patches_y = 1
+        ys = [0]
     else:
-        patches_y = (height - patch_size + stride - 1) // stride + 1
+        ys = list(range(0, height - patch_size + 1, stride))
+        last = height - patch_size
+        if ys[-1] != last:
+            ys.append(last)
 
     transform = get_transform()
 
@@ -685,10 +749,8 @@ def predict_spatial_distribution_hex(
     spatial_maps = {m: np.zeros((height, width), dtype=np.float32) for m in selected_markers}
     weight_map = np.zeros((height, width), dtype=np.float32)
 
-    for py in range(patches_y):
-        for px in range(patches_x):
-            x = min(px * stride, max(0, width - patch_size))
-            y = min(py * stride, max(0, height - patch_size))
+    for y in ys:
+        for x in xs:
 
             pw = min(patch_size, width - x)
             ph = min(patch_size, height - y)
@@ -732,7 +794,7 @@ def predict_spatial_distribution_hex(
     return spatial_maps, global_predictions
 
 
-def render_single_marker_fluorescent(spatial_map, marker, tissue_mask=None):
+def render_single_marker_fluorescent(spatial_map, marker, tissue_mask=None, threshold_percentile: float = 80.0):
     import scipy.ndimage as ndimage
     spatial_dist = np.clip(spatial_map.astype(np.float32, copy=False), 0, 1)
     if tissue_mask is not None:
@@ -740,12 +802,13 @@ def render_single_marker_fluorescent(spatial_map, marker, tissue_mask=None):
 
     mask_vals = spatial_dist[tissue_mask] if tissue_mask is not None else spatial_dist[spatial_dist > 0]
     if mask_vals.size:
-        t = float(np.percentile(mask_vals, 80))
+        p = float(np.clip(threshold_percentile, 0.0, 99.9))
+        t = float(np.percentile(mask_vals, p))
         spatial_dist = np.clip(spatial_dist - t, 0, None)
 
     spatial_dist = np.power(spatial_dist, 0.6)
     spatial_dist = spatial_dist ** 0.8
-    spatial_dist = ndimage.gaussian_filter(spatial_dist, sigma=2)
+    spatial_dist = ndimage.gaussian_filter(spatial_dist, sigma=1.2)
     if tissue_mask is not None:
         spatial_dist = spatial_dist * tissue_mask.astype(np.float32, copy=False)
 
@@ -778,7 +841,7 @@ def render_single_marker_fluorescent(spatial_map, marker, tissue_mask=None):
     return Image.fromarray(rgb, "RGB")
 
 
-def generate_spatial_fluorescent(img, spatial_maps, selected_markers=None, alpha=0.6, tissue_mask=None):
+def generate_spatial_fluorescent(img, spatial_maps, selected_markers=None, alpha=0.6, tissue_mask=None, threshold_percentile: float = 80.0):
     """
     基于空间分布图生成真实感荧光叠加图像
     
@@ -823,7 +886,8 @@ def generate_spatial_fluorescent(img, spatial_maps, selected_markers=None, alpha
 
         mask_vals = spatial_dist[tissue_mask] if tissue_mask is not None else spatial_dist[spatial_dist > 0]
         if mask_vals.size:
-            t = float(np.percentile(mask_vals, 80))
+            p = float(np.clip(threshold_percentile, 0.0, 99.9))
+            t = float(np.percentile(mask_vals, p))
             spatial_dist = np.clip(spatial_dist - t, 0, None)
         
         # 获取该标志物的荧光颜色 (BGR -> RGB)
@@ -836,7 +900,7 @@ def generate_spatial_fluorescent(img, spatial_maps, selected_markers=None, alpha
         spatial_dist = spatial_dist ** 0.8  # 进一步增强
         
         # 应用高斯模糊模拟荧光扩散效果
-        spatial_dist = ndimage.gaussian_filter(spatial_dist, sigma=2)
+        spatial_dist = ndimage.gaussian_filter(spatial_dist, sigma=1.2)
         if tissue_mask is not None:
             spatial_dist = spatial_dist * tissue_mask.astype(np.float32, copy=False)
         
@@ -1018,8 +1082,17 @@ def generate_fluorescent():
         image_path = data.get('image_path')
         selected_markers = data.get('selected_markers')
         alpha = data.get('alpha', 0.6)
-        mode = data.get('mode', 'spatial')  # 'spatial' or 'random'
+        threshold_percentile = float(data.get('sparsity_percentile', 80))
+        mode = data.get('mode', 'spatial')
+        output_dir = data.get('output_dir', None)
+        job_id = data.get('job_id', None)
+        transparent_alpha_floor = float(data.get('transparent_alpha_floor', 0.0))
+
+        if mode == "hex" and (output_dir is None or str(output_dir).strip() == ""):
+            output_dir = "/home/acproject/workspace/python_projects/HEX/bridge_out_web"
         
+        saved_files = None
+
         # 加载图像
         img = Image.open(image_path).convert('RGB')
         original_size = img.size
@@ -1050,8 +1123,8 @@ def generate_fluorescent():
             print(f"正在进行空间分布预测 (推理尺寸: {infer_size}, 显示尺寸: {display_size})...")
             spatial_maps, predictions = predict_spatial_distribution_hex(
                 img_infer,
-                patch_size=224,
-                stride=56,
+                patch_size=192,
+                stride=48,
                 selected_markers=selected_markers,
                 white_thresh=0.95,
                 clip_01=True,
@@ -1068,15 +1141,129 @@ def generate_fluorescent():
                 selected_markers, 
                 alpha,
                 tissue_mask=tissue_mask,
+                threshold_percentile=threshold_percentile,
             )
-            per_marker_images_pil = {m: render_single_marker_fluorescent(spatial_maps[m], m, tissue_mask=tissue_mask) for m in selected_markers if m in spatial_maps}
+            per_marker_images_pil = {m: render_single_marker_fluorescent(spatial_maps[m], m, tissue_mask=tissue_mask, threshold_percentile=threshold_percentile) for m in selected_markers if m in spatial_maps}
 
             if result.size != display_size:
                 result = result.resize(display_size, Image.LANCZOS)
                 fluorescent_only = fluorescent_only.resize(display_size, Image.LANCZOS)
                 per_marker_images_pil = {m: im.resize(display_size, Image.LANCZOS) for m, im in per_marker_images_pil.items()}
 
-            fl_only_base64 = image_to_base64(fluorescent_only)
+            fluorescent_only_rgba = _rgb_black_to_transparent_rgba(
+                fluorescent_only,
+                alpha_floor=transparent_alpha_floor,
+                alpha_gamma=1.0,
+            )
+            per_marker_images_pil = {
+                m: _rgb_black_to_transparent_rgba(im, alpha_floor=transparent_alpha_floor, alpha_gamma=1.0)
+                for m, im in per_marker_images_pil.items()
+            }
+
+            fl_only_base64 = image_to_base64(fluorescent_only_rgba)
+            per_marker_images = {m: image_to_base64(im) for m, im in per_marker_images_pil.items()}
+        elif mode == "hex":
+            import h5py  # type: ignore
+            import predict_he_to_codex_h5 as hex_h5  # type: ignore
+
+            if output_dir:
+                out_root = Path(output_dir).expanduser().resolve()
+                project_root = Path("/home/acproject/workspace/python_projects/HEX").resolve()
+                if project_root not in out_root.parents and out_root != project_root:
+                    raise ValueError("output_dir must be inside /home/acproject/workspace/python_projects/HEX")
+                out_root.mkdir(parents=True, exist_ok=True)
+                run_dir = out_root
+                managed_tmp = None
+            else:
+                managed_tmp = tempfile.TemporaryDirectory(prefix="hex_fluor_")
+                run_dir = Path(managed_tmp.name)
+
+            try:
+                name = str(job_id).strip() if job_id else Path(image_path).stem
+                if not name:
+                    name = uuid.uuid4().hex
+
+                pred_h5_dir = run_dir / "he2codex" / "pred_h5"
+                codex_npy_dir = run_dir / "he2codex" / "codex_npy"
+                png_dir = run_dir / "he2codex" / "fluorescent_png"
+                pred_h5_dir.mkdir(parents=True, exist_ok=True)
+                codex_npy_dir.mkdir(parents=True, exist_ok=True)
+                png_dir.mkdir(parents=True, exist_ok=True)
+
+                tmp_h5 = pred_h5_dir / f"{name}.h5"
+                tmp_npy = codex_npy_dir / f"{name}.npy"
+
+                hex_h5.predict_to_h5_from_pil(
+                    img=img_infer,
+                    output_h5=tmp_h5,
+                    model=model,
+                    device=device,
+                    patch_size=224,
+                    stride=112,
+                    batch_size=64,
+                    white_thresh=0.92,
+                    clip_01=True,
+                    max_patches=None,
+                    export_png_dir=png_dir,
+                    export_markers=selected_markers,
+                    export_alpha=float(alpha),
+                    export_threshold_percentile=float(threshold_percentile),
+                )
+
+                stem = tmp_h5.stem.replace("_pred", "")
+                overlay_path = png_dir / f"{stem}_fluorescent_overlay.png"
+                fl_only_path = png_dir / f"{stem}_fluorescent_only.png"
+                marker_dir = png_dir / f"{stem}_markers"
+
+                result = Image.open(str(overlay_path)).convert("RGB")
+                fluorescent_only = Image.open(str(fl_only_path)).convert("RGB")
+
+                per_marker_images_pil = {}
+                for m in selected_markers:
+                    p = marker_dir / f"{m}.png"
+                    if p.exists():
+                        per_marker_images_pil[m] = Image.open(str(p)).convert("RGB")
+
+                hex_h5.h5_to_grid_npy(tmp_h5, tmp_npy)
+                saved_files = {
+                    "pred_h5": str(tmp_h5),
+                    "codex_npy": str(tmp_npy),
+                    "fluorescent_overlay_png": str(overlay_path),
+                    "fluorescent_only_png": str(fl_only_path),
+                    "marker_dir": str(marker_dir),
+                }
+
+                with h5py.File(str(tmp_h5), "r") as f:
+                    pred = f["codex_prediction"][:]
+                pred = pred.astype(np.float32, copy=False)
+                pred = np.clip(pred, 0.0, 1.0)
+                marker_to_idx = {BIOMARKER_NAMES[i]: i - 1 for i in range(1, 41)}
+                predictions = {}
+                for m in selected_markers:
+                    idx = marker_to_idx.get(m, None)
+                    if idx is None:
+                        continue
+                    predictions[m] = float(np.mean(pred[:, idx])) if pred.shape[0] else 0.0
+            finally:
+                if managed_tmp is not None:
+                    managed_tmp.cleanup()
+
+            if result.size != display_size:
+                result = result.resize(display_size, Image.LANCZOS)
+                fluorescent_only = fluorescent_only.resize(display_size, Image.LANCZOS)
+                per_marker_images_pil = {m: im.resize(display_size, Image.LANCZOS) for m, im in per_marker_images_pil.items()}
+
+            fluorescent_only_rgba = _rgb_black_to_transparent_rgba(
+                fluorescent_only,
+                alpha_floor=transparent_alpha_floor,
+                alpha_gamma=1.0,
+            )
+            per_marker_images_pil = {
+                m: _rgb_black_to_transparent_rgba(im, alpha_floor=transparent_alpha_floor, alpha_gamma=1.0)
+                for m, im in per_marker_images_pil.items()
+            }
+
+            fl_only_base64 = image_to_base64(fluorescent_only_rgba)
             per_marker_images = {m: image_to_base64(im) for m, im in per_marker_images_pil.items()}
         else:
             # 旧方法：随机分布（更快但无空间信息）
@@ -1102,7 +1289,8 @@ def generate_fluorescent():
             'per_marker_images': per_marker_images,
             'original_resized': original_resized_base64,
             'image_size': display_size,
-            'mode': mode
+            'mode': mode,
+            'saved_files': saved_files,
         })
         
     except Exception as e:

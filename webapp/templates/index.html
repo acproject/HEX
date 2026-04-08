@@ -503,6 +503,7 @@
                         <label style="color: #aaa;">预测模式:</label>
                         <select id="modeSelect" style="width: 100%; margin-top: 5px; padding: 8px; background: #2a2a2a; color: white; border: 1px solid #444; border-radius: 5px;">
                             <option value="spatial">🔬 空间分布预测 (真实位置)</option>
+                            <option value="hex">✨ HEX脚本渲染 (更接近CODEX)</option>
                             <option value="random">⚡ 快速随机分布 (仅展示)</option>
                         </select>
                         <p style="color: #888; font-size: 12px; margin-top: 5px;">
@@ -514,6 +515,14 @@
                     <div style="margin-top: 15px;">
                         <label style="color: #aaa;">叠加透明度: <span id="alphaValue">0.6</span></label>
                         <input type="range" id="alphaSlider" min="0" max="1" step="0.1" value="0.6" style="width: 100%;">
+                    </div>
+
+                    <div style="margin-top: 15px;">
+                        <label style="color: #aaa;">亮点稀疏度(阈值分位): <span id="sparsityValue">80</span></label>
+                        <input type="range" id="sparsitySlider" min="50" max="95" step="1" value="80" style="width: 100%;">
+                        <p style="color: #888; font-size: 12px; margin-top: 5px;">
+                            值越大越稀疏、背景更黑；值越小信号更连续、更“铺开”
+                        </p>
                     </div>
                     
                     <div style="margin-top: 15px;">
@@ -530,7 +539,11 @@
                         <button class="tab" onclick="switchFluorescentTab('original', event)">原始H&E</button>
                     </div>
                     <div class="image-preview" id="fluorescentPreview">
-                        <img id="fluorescentImage" src="" alt="Fluorescent" style="max-width: 100%; border-radius: 10px;">
+                        <div id="overlayStack" style="position: relative; width: 100%; display: none;">
+                            <img id="overlayBaseImage" src="" alt="H&E Base" style="width: 100%; display: block; border-radius: 10px;">
+                            <img id="overlayFluorescentLayer" src="" alt="Fluorescent Layer" style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; border-radius: 10px; pointer-events: none; opacity: 0.6;">
+                        </div>
+                        <img id="fluorescentImage" src="" alt="Fluorescent" style="max-width: 100%; border-radius: 10px; display: block;">
                     </div>
                     <div id="markerLayers" style="display: none; margin-top: 10px;">
                         <h4 style="color: #00d4ff; margin: 0 0 10px 0;">通道图层</h4>
@@ -912,11 +925,21 @@
             if (!alphaSlider.dataset.bound) {
                 alphaSlider.addEventListener('input', function() {
                     document.getElementById('alphaValue').textContent = this.value;
-                });
-                alphaSlider.addEventListener('change', function() {
-                    scheduleGenerateFluorescent();
+                        const layer = document.getElementById('overlayFluorescentLayer');
+                        if (layer) layer.style.opacity = String(this.value);
                 });
                 alphaSlider.dataset.bound = '1';
+            }
+
+            const sparsitySlider = document.getElementById('sparsitySlider');
+            if (!sparsitySlider.dataset.bound) {
+                sparsitySlider.addEventListener('input', function() {
+                    document.getElementById('sparsityValue').textContent = this.value;
+                });
+                sparsitySlider.addEventListener('change', function() {
+                    scheduleGenerateFluorescent();
+                });
+                sparsitySlider.dataset.bound = '1';
             }
 
             const modeSelect = document.getElementById('modeSelect');
@@ -1016,12 +1039,9 @@
 
         function showMarkerChannel(name) {
             if (!perMarkerImages || !perMarkerImages[name]) return;
+            switchFluorescentTab('fluorescent');
             const img = document.getElementById('fluorescentImage');
             img.src = `data:image/png;base64,${perMarkerImages[name]}`;
-            currentTab = `channel:${name}`;
-            document.querySelectorAll('#fluorescentSection .tab').forEach(t => t.classList.remove('active'));
-            const tabs = document.querySelectorAll('#fluorescentSection .tab');
-            if (tabs[1]) tabs[1].classList.add('active');
             const wrap = document.getElementById('markerLayers');
             const title = wrap ? wrap.querySelector('h4') : null;
             if (title) title.textContent = `通道图层（当前：${name}，点击缩略图切换）`;
@@ -1044,6 +1064,7 @@
             }
             
             const alpha = parseFloat(document.getElementById('alphaSlider').value);
+            const sparsityPercentile = parseFloat(document.getElementById('sparsitySlider').value);
             const mode = document.getElementById('modeSelect').value;
             
             // 显示加载提示
@@ -1063,6 +1084,7 @@
                         image_path: currentImagePath,
                         selected_markers: selectedMarkers,
                         alpha: alpha,
+                        sparsity_percentile: sparsityPercentile,
                         mode: mode
                     })
                 });
@@ -1116,15 +1138,29 @@
             }
             
             const img = document.getElementById('fluorescentImage');
+            const overlayStack = document.getElementById('overlayStack');
+            const overlayBase = document.getElementById('overlayBaseImage');
+            const overlayLayer = document.getElementById('overlayFluorescentLayer');
             
             switch(tab) {
                 case 'overlay':
-                    if (overlayImage) img.src = `data:image/png;base64,${overlayImage}`;
+                    if (overlayStack) overlayStack.style.display = 'block';
+                    if (img) img.style.display = 'none';
+                    if (overlayBase) {
+                        if (originalResizedImage) overlayBase.src = `data:image/png;base64,${originalResizedImage}`;
+                        else if (originalImage) overlayBase.src = `data:image/png;base64,${originalImage}`;
+                    }
+                    if (overlayLayer && fluorescentOnlyImage) overlayLayer.src = `data:image/png;base64,${fluorescentOnlyImage}`;
+                    if (overlayLayer) overlayLayer.style.opacity = String(document.getElementById('alphaSlider').value);
                     break;
                 case 'fluorescent':
+                    if (overlayStack) overlayStack.style.display = 'none';
+                    if (img) img.style.display = 'block';
                     if (fluorescentOnlyImage) img.src = `data:image/png;base64,${fluorescentOnlyImage}`;
                     break;
                 case 'original':
+                    if (overlayStack) overlayStack.style.display = 'none';
+                    if (img) img.style.display = 'block';
                     if (originalResizedImage) img.src = `data:image/png;base64,${originalResizedImage}`;
                     else if (originalImage) img.src = `data:image/png;base64,${originalImage}`;
                     break;
