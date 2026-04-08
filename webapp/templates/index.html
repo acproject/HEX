@@ -546,7 +546,13 @@
                         <img id="fluorescentImage" src="" alt="Fluorescent" style="max-width: 100%; border-radius: 10px; display: block;">
                     </div>
                     <div id="markerLayers" style="display: none; margin-top: 10px;">
-                        <h4 style="color: #00d4ff; margin: 0 0 10px 0;">通道图层</h4>
+                        <div style="display:flex; justify-content: space-between; align-items:center; margin: 0 0 10px 0;">
+                            <h4 style="color: #00d4ff; margin: 0;">通道图层</h4>
+                            <div style="display:flex; gap: 8px;">
+                                <button class="btn btn-secondary" style="padding: 4px 10px; font-size: 12px;" onclick="selectAllOverlayLayers(true)">✓ 全选</button>
+                                <button class="btn btn-secondary" style="padding: 4px 10px; font-size: 12px;" onclick="selectAllOverlayLayers(false)">✗ 全不选</button>
+                            </div>
+                        </div>
                         <div id="markerLayerGrid" style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; max-height: 320px; overflow-y: auto;"></div>
                     </div>
                 </div>
@@ -1041,6 +1047,15 @@
                 item.addEventListener('click', () => showMarkerChannel(name));
                 grid.appendChild(item);
             });
+            scheduleOverlayComposite();
+        }
+
+        function selectAllOverlayLayers(selectAll) {
+            const cbs = Array.from(document.querySelectorAll('.overlay-layer-cb'));
+            cbs.forEach(cb => {
+                cb.checked = !!selectAll;
+            });
+            overlaySelectedMarkers = selectAll ? cbs.map(cb => cb.value) : [];
             scheduleOverlayComposite();
         }
 
