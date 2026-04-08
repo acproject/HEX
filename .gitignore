@@ -4,3 +4,5 @@ webapp/static/temp/**
 bridge_out_test
 bridge_out_web
 __pycache__
+.venv
+

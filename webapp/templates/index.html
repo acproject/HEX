@@ -571,6 +571,9 @@
     <script>
         let radarChart = null;
         let barChart = null;
+        let overlaySelectedMarkers = null;
+        let overlayCompositeDebounceTimer = null;
+        const _overlayImgCache = {};
         
         // 颜色映射
         const categoryColors = {
@@ -999,7 +1002,7 @@
             const grid = document.getElementById('markerLayerGrid');
             grid.innerHTML = '';
             const title = wrap.querySelector('h4');
-            if (title) title.textContent = '通道图层（点击缩略图查看大图）';
+            if (title) title.textContent = '通道图层（点击缩略图查看大图；勾选用于叠加）';
 
             if (!perMarkerImages || Object.keys(perMarkerImages).length === 0) {
                 wrap.style.display = 'none';
@@ -1007,21 +1010,97 @@
             }
 
             wrap.style.display = 'block';
-            Object.keys(perMarkerImages).forEach(name => {
+            const names = Object.keys(perMarkerImages);
+            if (!overlaySelectedMarkers) overlaySelectedMarkers = names.slice();
+            names.forEach(name => {
                 const b64 = perMarkerImages[name];
                 const value = perMarkerValues && perMarkerValues[name] !== undefined ? perMarkerValues[name] : null;
                 const item = document.createElement('div');
                 item.style.cssText = 'background: rgba(255,255,255,0.05); border-radius: 10px; padding: 8px; cursor: pointer;';
+                const checked = overlaySelectedMarkers.includes(name) ? 'checked' : '';
                 item.innerHTML = `
                     <div style="display:flex; justify-content: space-between; align-items:center; margin-bottom:6px;">
-                        <div style="color:#fff; font-size: 13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${name}</div>
-                        <div style="color:#00d4ff; font-size: 12px;">${value !== null ? value.toFixed(3) : ''}</div>
+                        <div style="display:flex; align-items:center; gap:8px; min-width:0;">
+                            <input class="overlay-layer-cb" type="checkbox" value="${name}" ${checked} style="transform: scale(1.05);">
+                            <div style="color:#fff; font-size: 13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">${name}</div>
+                        </div>
+                        <div style="color:#00d4ff; font-size: 12px; flex: 0 0 auto;">${value !== null ? value.toFixed(3) : ''}</div>
                     </div>
                     <img src="data:image/png;base64,${b64}" style="width:100%; border-radius: 8px; display:block;">
                 `;
+                const cb = item.querySelector('.overlay-layer-cb');
+                if (cb) {
+                    cb.addEventListener('click', (e) => {
+                        e.stopPropagation();
+                    });
+                    cb.addEventListener('change', () => {
+                        overlaySelectedMarkers = Array.from(document.querySelectorAll('.overlay-layer-cb:checked')).map(x => x.value);
+                        scheduleOverlayComposite();
+                    });
+                }
                 item.addEventListener('click', () => showMarkerChannel(name));
                 grid.appendChild(item);
             });
+            scheduleOverlayComposite();
+        }
+
+        function scheduleOverlayComposite() {
+            if (overlayCompositeDebounceTimer) clearTimeout(overlayCompositeDebounceTimer);
+            overlayCompositeDebounceTimer = setTimeout(() => {
+                updateOverlayComposite();
+            }, 60);
+        }
+
+        async function _loadB64Image(b64) {
+            if (_overlayImgCache[b64]) return _overlayImgCache[b64];
+            const img = new Image();
+            img.decoding = 'async';
+            img.src = `data:image/png;base64,${b64}`;
+            try { await img.decode(); } catch (e) {}
+            _overlayImgCache[b64] = img;
+            return img;
+        }
+
+        async function updateOverlayComposite() {
+            if (currentTab !== 'overlay') return;
+            const overlayStack = document.getElementById('overlayStack');
+            const overlayLayer = document.getElementById('overlayFluorescentLayer');
+            if (!overlayStack || !overlayLayer) return;
+            if (!perMarkerImages || Object.keys(perMarkerImages).length === 0) {
+                if (fluorescentOnlyImage) overlayLayer.src = `data:image/png;base64,${fluorescentOnlyImage}`;
+                overlayLayer.style.display = 'block';
+                return;
+            }
+
+            const selected = overlaySelectedMarkers || [];
+            if (selected.length === 0) {
+                overlayLayer.src = '';
+                overlayLayer.style.display = 'none';
+                return;
+            }
+            overlayLayer.style.display = 'block';
+
+            const firstB64 = perMarkerImages[selected[0]];
+            if (!firstB64) return;
+            const firstImg = await _loadB64Image(firstB64);
+            const w = firstImg.naturalWidth || firstImg.width;
+            const h = firstImg.naturalHeight || firstImg.height;
+            if (!w || !h) return;
+
+            const canvas = document.createElement('canvas');
+            canvas.width = w;
+            canvas.height = h;
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return;
+            ctx.clearRect(0, 0, w, h);
+            ctx.globalCompositeOperation = 'lighter';
+            for (const name of selected) {
+                const b64 = perMarkerImages[name];
+                if (!b64) continue;
+                const im = await _loadB64Image(b64);
+                ctx.drawImage(im, 0, 0, w, h);
+            }
+            overlayLayer.src = canvas.toDataURL('image/png');
         }
 
         function updateMarkerValueDisplay(values) {
@@ -1101,6 +1180,7 @@
                 originalResizedImage = data.original_resized || null;
                 perMarkerImages = data.per_marker_images || null;
                 perMarkerValues = data.predictions || null;
+                overlaySelectedMarkers = perMarkerImages ? Object.keys(perMarkerImages) : null;
                 updateMarkerValueDisplay(perMarkerValues);
                 renderMarkerLayers();
                 
@@ -1150,7 +1230,7 @@
                         if (originalResizedImage) overlayBase.src = `data:image/png;base64,${originalResizedImage}`;
                         else if (originalImage) overlayBase.src = `data:image/png;base64,${originalImage}`;
                     }
-                    if (overlayLayer && fluorescentOnlyImage) overlayLayer.src = `data:image/png;base64,${fluorescentOnlyImage}`;
+                    scheduleOverlayComposite();
                     if (overlayLayer) overlayLayer.style.opacity = String(document.getElementById('alphaSlider').value);
                     break;
                 case 'fluorescent':
