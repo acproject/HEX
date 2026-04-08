@@ -6,6 +6,7 @@ HEX/MUSK 可视化Web应用
 import os
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'MUSK'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'hex'))
 
 import torch
 import numpy as np
@@ -17,17 +18,20 @@ from io import BytesIO
 import json
 import cv2
 import colorsys
+import threading
 
-# MUSK相关导入
+# MUSK/HEX相关导入
 from musk import utils, modeling
 from timm.data.constants import IMAGENET_INCEPTION_MEAN, IMAGENET_INCEPTION_STD
 import torchvision.transforms as transforms
+from hex_architecture import CustomModel
 
 app = Flask(__name__)
 
 # 全局变量存储模型
 model = None
 device = None
+MODEL_LOAD_LOCK = threading.Lock()
 
 # 生物标志物名称
 BIOMARKER_NAMES = {
@@ -53,38 +57,61 @@ BIOMARKER_CATEGORIES = {
 }
 
 
-def load_models():
+def load_models(hex_ckpt_path: str | None = None):
     """加载MUSK和HEX模型"""
     global model, device
-    
-    if model is not None:
-        return
-    
-    print("正在加载MUSK模型...")
-    
-    # 检测设备
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    if torch.cuda.is_available():
-        cap = torch.cuda.get_device_capability(0)
-        if cap[0] < 7.5:  # V100 is CC 7.0
-            print(f"GPU CC {cap[0]}.{cap[1]} 不兼容，使用CPU模式")
-            device = 'cpu'
-    
-    print(f"使用设备: {device}")
-    
-    # 加载MUSK模型
-    from musk.modeling import _get_large_config, MUSK
-    args = _get_large_config(img_size=384, vocab_size=64010)
-    model = MUSK(args)
-    
-    # 本地模型路径
-    musk_path = "/home/acproject/workspace/python_projects/HEX/models/musk/model.safetensors"
-    utils.load_model_and_may_interpolate(musk_path, model, 'model|module', '')
-    
-    model = model.to(device)
-    model.eval()
-    
-    print("MUSK模型加载完成!")
+    with MODEL_LOAD_LOCK:
+        if model is not None:
+            return
+
+        print("正在加载模型...")
+
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        print(f"使用设备: {device}")
+
+        model = CustomModel(visual_output_dim=1024, num_outputs=40)
+
+        if hex_ckpt_path is None:
+            hex_ckpt_path = "/home/acproject/workspace/python_projects/HEX/hex/checkpoint.pth"
+
+        if os.path.exists(hex_ckpt_path):
+            print(f"加载HEX checkpoint: {hex_ckpt_path}")
+            sd = torch.load(hex_ckpt_path, map_location="cpu")
+            incompat = model.load_state_dict(sd, strict=False)
+            print(f"  missing_keys={len(incompat.missing_keys)} unexpected_keys={len(incompat.unexpected_keys)}")
+        else:
+            print("⚠️  警告: 未找到HEX checkpoint，使用随机初始化的回归头")
+
+        model.eval()
+        if device == "cuda":
+            try:
+                model = model.to(device)
+                with torch.no_grad():
+                    _ = model(torch.zeros((1, 3, 384, 384), dtype=torch.float32, device=device))
+            except Exception as e:
+                if "GET was unable to find an engine to execute this computation" in str(e):
+                    torch.backends.cudnn.enabled = False
+                    try:
+                        model = model.to(device)
+                        with torch.no_grad():
+                            _ = model(torch.zeros((1, 3, 384, 384), dtype=torch.float32, device=device))
+                        print("已禁用 cuDNN（V100/SM70 兼容模式）")
+                    except Exception as e2:
+                        if os.environ.get("HEX_FORCE_CUDA", "").strip() in ("1", "true", "True"):
+                            raise
+                        print(f"CUDA 运行不稳定，回退到CPU: {e2}")
+                        device = "cpu"
+                        model = model.to(device)
+                else:
+                    if os.environ.get("HEX_FORCE_CUDA", "").strip() in ("1", "true", "True"):
+                        raise
+                    print(f"CUDA 运行不稳定，回退到CPU: {e}")
+                    device = "cpu"
+                    model = model.to(device)
+        else:
+            model = model.to(device)
+
+        print("HEX模型加载完成!")
 
 
 def get_transform():
@@ -103,6 +130,14 @@ def image_to_base64(img):
     return base64.b64encode(buffered.getvalue()).decode('utf-8')
 
 
+def _compute_tissue_mask(img, white_thresh: float = 0.92):
+    arr = np.asarray(img, dtype=np.float32) / 255.0
+    if arr.ndim != 3 or arr.shape[2] != 3:
+        return None
+    gray = (arr[:, :, 0] + arr[:, :, 1] + arr[:, :, 2]) / 3.0
+    return gray < white_thresh
+
+
 def extract_features(img_tensor):
     """使用MUSK提取图像特征"""
     global model, device
@@ -117,6 +152,22 @@ def extract_features(img_tensor):
         )[0]
     
     return features.cpu().numpy()
+
+
+def predict_global_hex(img, clip_01=True):
+    global model, device
+    transform = get_transform()
+    img_tensor = transform(img).unsqueeze(0)
+    with torch.no_grad():
+        out = model(img_tensor.to(device))
+    if isinstance(out, (tuple, list)):
+        preds = out[0]
+    else:
+        preds = out
+    preds = preds[0].detach().cpu().numpy().astype(np.float32, copy=False)
+    if clip_01:
+        preds = np.clip(preds, 0.0, 1.0)
+    return {BIOMARKER_NAMES[i]: float(preds[i - 1]) for i in range(1, 41)}
 
 
 def generate_virtual_proteomics(features):
@@ -232,10 +283,10 @@ def analyze():
         # 预处理
         transform = get_transform()
         img_tensor = transform(img).unsqueeze(0)
-        
+
         # 提取特征
         features = extract_features(img_tensor)
-        
+
         # 生成虚拟蛋白质组学预测
         predictions = generate_virtual_proteomics(features)
         
@@ -498,8 +549,15 @@ def predict_spatial_distribution(img, patch_size=224, stride=112):
     width, height = img.size
     
     # 计算patch网格
-    patches_x = max(1, (width - patch_size) // stride + 1)
-    patches_y = max(1, (height - patch_size) // stride + 1)
+    if width <= patch_size:
+        patches_x = 1
+    else:
+        patches_x = (width - patch_size + stride - 1) // stride + 1
+
+    if height <= patch_size:
+        patches_y = 1
+    else:
+        patches_y = (height - patch_size + stride - 1) // stride + 1
     
     # 存储每个patch的预测和坐标
     all_predictions = []
@@ -580,7 +638,147 @@ def predict_spatial_distribution(img, patch_size=224, stride=112):
     return spatial_maps, global_predictions
 
 
-def generate_spatial_fluorescent(img, spatial_maps, selected_markers=None, alpha=0.6):
+def _is_background_patch(pil_img, white_thresh: float) -> bool:
+    if white_thresh >= 1.0:
+        return False
+    arr = np.asarray(pil_img, dtype=np.float32) / 255.0
+    if arr.ndim != 3 or arr.shape[2] != 3:
+        return False
+    gray = (arr[:, :, 0] + arr[:, :, 1] + arr[:, :, 2]) / 3.0
+    return float(gray.mean()) >= white_thresh
+
+
+def predict_spatial_distribution_hex(
+    img,
+    patch_size=224,
+    stride=112,
+    selected_markers=None,
+    white_thresh=0.95,
+    clip_01=True,
+):
+    global model, device
+    width, height = img.size
+
+    if selected_markers is None:
+        selected_markers = [BIOMARKER_NAMES[i] for i in range(1, 11)]
+
+    marker_to_idx = {BIOMARKER_NAMES[i]: i - 1 for i in range(1, 41)}
+
+    if width <= patch_size:
+        patches_x = 1
+    else:
+        patches_x = (width - patch_size + stride - 1) // stride + 1
+
+    if height <= patch_size:
+        patches_y = 1
+    else:
+        patches_y = (height - patch_size + stride - 1) // stride + 1
+
+    transform = get_transform()
+
+    yy, xx = np.mgrid[0:patch_size, 0:patch_size]
+    cy = (patch_size - 1) / 2.0
+    cx = (patch_size - 1) / 2.0
+    sigma = max(1.0, patch_size / 3.0)
+    weight_full = np.exp(-((yy - cy) ** 2 + (xx - cx) ** 2) / (2.0 * sigma**2)).astype(np.float32)
+
+    spatial_maps = {m: np.zeros((height, width), dtype=np.float32) for m in selected_markers}
+    weight_map = np.zeros((height, width), dtype=np.float32)
+
+    for py in range(patches_y):
+        for px in range(patches_x):
+            x = min(px * stride, max(0, width - patch_size))
+            y = min(py * stride, max(0, height - patch_size))
+
+            pw = min(patch_size, width - x)
+            ph = min(patch_size, height - y)
+
+            patch = img.crop((x, y, x + pw, y + ph))
+            if _is_background_patch(patch, white_thresh):
+                continue
+
+            if pw < patch_size or ph < patch_size:
+                new_patch = Image.new("RGB", (patch_size, patch_size), (255, 255, 255))
+                new_patch.paste(patch, (0, 0))
+                patch = new_patch
+
+            patch_tensor = transform(patch).unsqueeze(0)
+
+            with torch.no_grad():
+                out = model(patch_tensor.to(device))
+
+            if isinstance(out, (tuple, list)):
+                preds = out[0]
+            else:
+                preds = out
+
+            preds = preds[0].detach().cpu().numpy().astype(np.float32, copy=False)
+            if clip_01:
+                preds = np.clip(preds, 0.0, 1.0)
+
+            w = weight_full[:ph, :pw]
+            for m in selected_markers:
+                idx = marker_to_idx.get(m, None)
+                if idx is None:
+                    continue
+                spatial_maps[m][y : y + ph, x : x + pw] += preds[idx] * w
+            weight_map[y : y + ph, x : x + pw] += w
+
+    weight_map = np.maximum(weight_map, 1e-8)
+    for m in spatial_maps:
+        spatial_maps[m] = spatial_maps[m] / weight_map
+
+    global_predictions = {m: float(np.mean(spatial_maps[m])) for m in spatial_maps}
+    return spatial_maps, global_predictions
+
+
+def render_single_marker_fluorescent(spatial_map, marker, tissue_mask=None):
+    import scipy.ndimage as ndimage
+    spatial_dist = np.clip(spatial_map.astype(np.float32, copy=False), 0, 1)
+    if tissue_mask is not None:
+        spatial_dist = spatial_dist * tissue_mask.astype(np.float32, copy=False)
+
+    mask_vals = spatial_dist[tissue_mask] if tissue_mask is not None else spatial_dist[spatial_dist > 0]
+    if mask_vals.size:
+        t = float(np.percentile(mask_vals, 80))
+        spatial_dist = np.clip(spatial_dist - t, 0, None)
+
+    spatial_dist = np.power(spatial_dist, 0.6)
+    spatial_dist = spatial_dist ** 0.8
+    spatial_dist = ndimage.gaussian_filter(spatial_dist, sigma=2)
+    if tissue_mask is not None:
+        spatial_dist = spatial_dist * tissue_mask.astype(np.float32, copy=False)
+
+    color = FLUORESCENT_COLORS.get(marker, (255, 255, 255))
+    r, g, b = color[2], color[1], color[0]
+    brightness = 1.6
+
+    rgb = np.zeros((spatial_dist.shape[0], spatial_dist.shape[1], 3), dtype=np.float32)
+    rgb[:, :, 0] = spatial_dist * r * brightness / 255.0
+    rgb[:, :, 1] = spatial_dist * g * brightness / 255.0
+    rgb[:, :, 2] = spatial_dist * b * brightness / 255.0
+
+    bloom = np.zeros_like(rgb)
+    for c in range(3):
+        bloom[:, :, c] = ndimage.gaussian_filter(rgb[:, :, c], sigma=5)
+    rgb = rgb + bloom * 0.3
+
+    max_val = float(np.max(rgb))
+    if max_val > 0:
+        for c in range(3):
+            channel = np.clip(rgb[:, :, c], 0, max_val)
+            nonzero = channel[channel > 0]
+            min_v = float(np.percentile(nonzero, 5)) if nonzero.size else 0.0
+            max_v = float(np.percentile(channel, 99.5))
+            if max_v > min_v:
+                channel = (channel - min_v) / (max_v - min_v)
+            rgb[:, :, c] = channel
+
+    rgb = np.clip(rgb * 255, 0, 255).astype(np.uint8)
+    return Image.fromarray(rgb, "RGB")
+
+
+def generate_spatial_fluorescent(img, spatial_maps, selected_markers=None, alpha=0.6, tissue_mask=None):
     """
     基于空间分布图生成真实感荧光叠加图像
     
@@ -606,6 +804,9 @@ def generate_spatial_fluorescent(img, spatial_maps, selected_markers=None, alpha
     
     if selected_markers is None:
         selected_markers = list(spatial_maps.keys())[:10]
+
+    if tissue_mask is None:
+        tissue_mask = _compute_tissue_mask(img, white_thresh=0.92)
     
     # 创建RGBA荧光图像（黑色背景）
     fluorescent_rgba = np.zeros((height, width, 4), dtype=np.float32)
@@ -615,7 +816,15 @@ def generate_spatial_fluorescent(img, spatial_maps, selected_markers=None, alpha
         if marker not in spatial_maps:
             continue
         
-        spatial_dist = spatial_maps[marker].copy()
+        spatial_dist = spatial_maps[marker].astype(np.float32, copy=False)
+        spatial_dist = np.clip(spatial_dist, 0, 1)
+        if tissue_mask is not None:
+            spatial_dist = spatial_dist * tissue_mask.astype(np.float32, copy=False)
+
+        mask_vals = spatial_dist[tissue_mask] if tissue_mask is not None else spatial_dist[spatial_dist > 0]
+        if mask_vals.size:
+            t = float(np.percentile(mask_vals, 80))
+            spatial_dist = np.clip(spatial_dist - t, 0, None)
         
         # 获取该标志物的荧光颜色 (BGR -> RGB)
         color = FLUORESCENT_COLORS.get(marker, (255, 255, 255))
@@ -623,12 +832,13 @@ def generate_spatial_fluorescent(img, spatial_maps, selected_markers=None, alpha
         
         # 增强对比度 - 使用非线性映射
         # 真实荧光信号是指数响应的
-        spatial_dist = np.clip(spatial_dist, 0, 1)
         spatial_dist = np.power(spatial_dist, 0.6)  # gamma校正增强低值
         spatial_dist = spatial_dist ** 0.8  # 进一步增强
         
         # 应用高斯模糊模拟荧光扩散效果
         spatial_dist = ndimage.gaussian_filter(spatial_dist, sigma=2)
+        if tissue_mask is not None:
+            spatial_dist = spatial_dist * tissue_mask.astype(np.float32, copy=False)
         
         # 增强亮度
         brightness = 1.5
@@ -648,6 +858,13 @@ def generate_spatial_fluorescent(img, spatial_maps, selected_markers=None, alpha
     # 将发光效果加回原图
     for c in range(3):
         fluorescent_rgba[:, :, c] = fluorescent_rgba[:, :, c] + bloom[:, :, c] * 0.3
+
+    if tissue_mask is not None:
+        m = tissue_mask.astype(np.float32, copy=False)
+        fluorescent_rgba[:, :, 0] *= m
+        fluorescent_rgba[:, :, 1] *= m
+        fluorescent_rgba[:, :, 2] *= m
+        fluorescent_rgba[:, :, 3] *= m
     
     # 归一化并增强对比度
     max_val = np.max(fluorescent_rgba[:, :, :3])
@@ -807,56 +1024,84 @@ def generate_fluorescent():
         img = Image.open(image_path).convert('RGB')
         original_size = img.size
         
-        # 缩小图像以加快处理速度
-        max_size = 800
-        if max(original_size) > max_size:
-            ratio = max_size / max(original_size)
-            new_size = (int(original_size[0] * ratio), int(original_size[1] * ratio))
-            img_resized = img.resize(new_size, Image.LANCZOS)
+        max_display_size = 800
+        if max(original_size) > max_display_size:
+            ratio = max_display_size / max(original_size)
+            display_size = (int(original_size[0] * ratio), int(original_size[1] * ratio))
+            img_display = img.resize(display_size, Image.LANCZOS)
         else:
-            img_resized = img
-            new_size = original_size
+            img_display = img
+            display_size = original_size
+
+        max_infer_size = 4096
+        if max(original_size) > max_infer_size:
+            ratio = max_infer_size / max(original_size)
+            infer_size = (int(original_size[0] * ratio), int(original_size[1] * ratio))
+            img_infer = img.resize(infer_size, Image.LANCZOS)
+        else:
+            img_infer = img
+            infer_size = original_size
         
         load_models()
+        if not selected_markers:
+            selected_markers = [BIOMARKER_NAMES[i] for i in range(1, 11)]
         
         if mode == 'spatial':
-            # 新方法：空间分布预测
-            print(f"正在进行空间分布预测 (图像尺寸: {new_size})...")
-            spatial_maps, predictions = predict_spatial_distribution(
-                img_resized, 
-                patch_size=224, 
-                stride=112
+            print(f"正在进行空间分布预测 (推理尺寸: {infer_size}, 显示尺寸: {display_size})...")
+            spatial_maps, predictions = predict_spatial_distribution_hex(
+                img_infer,
+                patch_size=224,
+                stride=56,
+                selected_markers=selected_markers,
+                white_thresh=0.95,
+                clip_01=True,
             )
             print(f"空间预测完成，共 {len(spatial_maps)} 个标志物")
             
             # 生成荧光叠加
+            tissue_mask = _compute_tissue_mask(img_infer, white_thresh=0.92)
+            if tissue_mask is not None and np.any(tissue_mask):
+                predictions = {m: float(np.mean(spatial_maps[m][tissue_mask])) for m in spatial_maps}
             result, fluorescent_only = generate_spatial_fluorescent(
-                img_resized, 
+                img_infer,
                 spatial_maps, 
                 selected_markers, 
-                alpha
+                alpha,
+                tissue_mask=tissue_mask,
             )
+            per_marker_images_pil = {m: render_single_marker_fluorescent(spatial_maps[m], m, tissue_mask=tissue_mask) for m in selected_markers if m in spatial_maps}
+
+            if result.size != display_size:
+                result = result.resize(display_size, Image.LANCZOS)
+                fluorescent_only = fluorescent_only.resize(display_size, Image.LANCZOS)
+                per_marker_images_pil = {m: im.resize(display_size, Image.LANCZOS) for m, im in per_marker_images_pil.items()}
+
             fl_only_base64 = image_to_base64(fluorescent_only)
+            per_marker_images = {m: image_to_base64(im) for m, im in per_marker_images_pil.items()}
         else:
             # 旧方法：随机分布（更快但无空间信息）
             transform = get_transform()
-            img_tensor = transform(img).unsqueeze(0)
+            img_tensor = transform(img_display).unsqueeze(0)
             features = extract_features(img_tensor)
             predictions = generate_virtual_proteomics(features)
             
-            fluorescent = generate_fluorescent_layer(new_size, predictions, selected_markers)
-            result = overlay_fluorescent_on_he(img_resized, fluorescent, alpha)
+            fluorescent = generate_fluorescent_layer(display_size, predictions, selected_markers)
+            result = overlay_fluorescent_on_he(img_display, fluorescent, alpha)
             fl_only_base64 = image_to_base64(fluorescent.convert('RGB'))
+            per_marker_images = {}
         
         # 转换为base64
         result_base64 = image_to_base64(result)
+        original_resized_base64 = image_to_base64(img_display)
         
         return jsonify({
             'success': True,
             'overlay_image': result_base64,
             'fluorescent_only': fl_only_base64,
             'predictions': predictions,
-            'image_size': new_size,
+            'per_marker_images': per_marker_images,
+            'original_resized': original_resized_base64,
+            'image_size': display_size,
             'mode': mode
         })
         
@@ -885,18 +1130,87 @@ def get_marker_colors():
 
 
 if __name__ == '__main__':
-    print("=" * 60)
-    print("HEX/MUSK 可视化Web应用")
-    print("=" * 60)
-    print()
-    
-    # 预加载模型
-    print("预加载模型...")
-    load_models()
-    print()
-    
-    print("启动Web服务器...")
-    print("请在浏览器中访问: http://localhost:5000")
-    print()
-    
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--offline", action="store_true")
+    parser.add_argument("--input", default=None)
+    parser.add_argument("--output_dir", default=None)
+    parser.add_argument("--hex_ckpt", default="/home/acproject/workspace/python_projects/HEX/hex/checkpoint.pth")
+    parser.add_argument("--patch_size", type=int, default=224)
+    parser.add_argument("--stride", type=int, default=112)
+    parser.add_argument("--alpha", type=float, default=0.6)
+    parser.add_argument("--white_thresh", type=float, default=0.95)
+    parser.add_argument("--max_size", type=int, default=0)
+    parser.add_argument("--markers", default="")
+    args = parser.parse_args()
+
+    if args.offline:
+        if args.input is None or args.output_dir is None:
+            raise SystemExit("--offline requires --input and --output_dir")
+
+        input_path = Path(args.input)
+        out_dir = Path(args.output_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        selected_markers = None
+        if args.markers.strip():
+            selected_markers = [m.strip() for m in args.markers.split(",") if m.strip()]
+
+        load_models(hex_ckpt_path=args.hex_ckpt)
+
+        def run_one(img_path: Path):
+            img = Image.open(str(img_path)).convert("RGB")
+            if args.max_size and max(img.size) > args.max_size:
+                ratio = args.max_size / max(img.size)
+                new_size = (int(img.size[0] * ratio), int(img.size[1] * ratio))
+                img = img.resize(new_size, Image.LANCZOS)
+
+            spatial_maps, predictions = predict_spatial_distribution_hex(
+                img,
+                patch_size=args.patch_size,
+                stride=args.stride,
+                selected_markers=selected_markers,
+                white_thresh=args.white_thresh,
+                clip_01=True,
+            )
+
+            overlay, fl_only = generate_spatial_fluorescent(
+                img,
+                spatial_maps,
+                selected_markers=selected_markers,
+                alpha=args.alpha,
+            )
+
+            stem = img_path.stem
+            overlay_path = out_dir / f"{stem}_overlay.png"
+            fl_path = out_dir / f"{stem}_fluorescent.png"
+            pred_path = out_dir / f"{stem}_predictions.json"
+
+            overlay.save(str(overlay_path))
+            fl_only.save(str(fl_path))
+            pred_path.write_text(json.dumps(predictions, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            print(f"[done] {img_path.name} -> {overlay_path.name}, {fl_path.name}, {pred_path.name}")
+
+        if input_path.is_dir():
+            img_files = []
+            for ext in ("*.tif", "*.tiff", "*.png", "*.jpg", "*.jpeg"):
+                img_files.extend(sorted(input_path.glob(ext)))
+            if not img_files:
+                raise SystemExit(f"No images found in {input_path}")
+            for p in img_files:
+                run_one(p)
+        else:
+            run_one(input_path)
+    else:
+        print("=" * 60)
+        print("HEX/MUSK 可视化Web应用")
+        print("=" * 60)
+        print()
+        print("预加载模型...")
+        load_models()
+        print()
+        print("启动Web服务器...")
+        print("请在浏览器中访问: http://localhost:5000")
+        print()
+        app.run(host='0.0.0.0', port=5000, debug=True)

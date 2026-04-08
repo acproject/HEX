@@ -1,3 +1,6 @@
 lung_cancer_organoid_HE
 models
 webapp/static/temp/**
+bridge_out_test
+bridge_out_web
+__pycache__
