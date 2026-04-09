@@ -136,7 +136,12 @@ def image_to_base64(img):
     return base64.b64encode(buffered.getvalue()).decode('utf-8')
 
 
-def _rgb_black_to_transparent_rgba(img_rgb: Image.Image, alpha_floor: float = 0.0, alpha_gamma: float = 1.0) -> Image.Image:
+def _rgb_black_to_transparent_rgba(
+    img_rgb: Image.Image,
+    alpha_floor: float = 0.0,
+    alpha_gamma: float = 1.0,
+    alpha_mask=None,
+) -> Image.Image:
     arr = np.asarray(img_rgb.convert("RGB"), dtype=np.uint8)
     intensity = np.max(arr, axis=2).astype(np.float32) / 255.0
     intensity = np.clip(intensity, 0.0, 1.0)
@@ -147,12 +152,99 @@ def _rgb_black_to_transparent_rgba(img_rgb: Image.Image, alpha_floor: float = 0.
     alpha = intensity
     if alpha_floor > 0.0:
         alpha = np.maximum(alpha, alpha_floor)
+
+    if alpha_mask is not None:
+        m = np.asarray(alpha_mask)
+        if m.shape != alpha.shape:
+            m_img = Image.fromarray((m.astype(np.uint8) * 255), mode="L")
+            m_img = m_img.resize((alpha.shape[1], alpha.shape[0]), Image.NEAREST)
+            m = (np.asarray(m_img, dtype=np.uint8) > 0)
+        else:
+            m = m.astype(bool, copy=False)
+        alpha = alpha * m.astype(np.float32, copy=False)
+
     alpha_u8 = (np.clip(alpha, 0.0, 1.0) * 255.0).astype(np.uint8)
 
     rgba = np.zeros((arr.shape[0], arr.shape[1], 4), dtype=np.uint8)
     rgba[:, :, :3] = arr
     rgba[:, :, 3] = alpha_u8
     return Image.fromarray(rgba, "RGBA")
+
+
+def _apply_psf_and_noise_rgb(
+    img_rgb: Image.Image,
+    psf_sigma: float = 0.0,
+    poisson_scale: float = 0.0,
+    background_noise_sigma: float = 0.0,
+    seed: int | None = None,
+) -> Image.Image:
+    import scipy.ndimage as ndimage
+
+    arr = np.asarray(img_rgb.convert("RGB"), dtype=np.float32) / 255.0
+
+    psf_sigma = float(psf_sigma)
+    if psf_sigma > 0:
+        for c in range(3):
+            arr[:, :, c] = ndimage.gaussian_filter(arr[:, :, c], sigma=psf_sigma)
+
+    if seed is not None:
+        rng = np.random.RandomState(int(seed))
+    else:
+        rng = np.random
+
+    poisson_scale = float(poisson_scale)
+    if poisson_scale > 0:
+        x = np.clip(arr * poisson_scale, 0.0, None)
+        x = rng.poisson(x).astype(np.float32) / poisson_scale
+        arr = np.clip(x, 0.0, 1.0)
+
+    background_noise_sigma = float(background_noise_sigma)
+    if background_noise_sigma > 0:
+        arr = arr + rng.normal(0.0, background_noise_sigma, size=arr.shape).astype(np.float32)
+        arr = np.clip(arr, 0.0, 1.0)
+
+    out = (arr * 255.0).astype(np.uint8)
+    return Image.fromarray(out, "RGB")
+
+
+def _normalize_spatial_maps_zscore(
+    spatial_maps: dict,
+    tissue_mask,
+    ref_stats: dict | None = None,
+    z_clip: float = 3.0,
+) -> dict:
+    z_clip = float(z_clip)
+    if z_clip <= 0:
+        return spatial_maps
+
+    out = {}
+    for name, m in spatial_maps.items():
+        x = m.astype(np.float32, copy=False)
+        if tissue_mask is not None:
+            vals = x[tissue_mask]
+        else:
+            vals = x.reshape(-1)
+
+        stats = ref_stats.get(name) if isinstance(ref_stats, dict) else None
+        if stats and "mean" in stats and "std" in stats and float(stats["std"]) > 0:
+            mu = float(stats["mean"])
+            sd = float(stats["std"])
+        else:
+            if vals.size:
+                mu = float(np.mean(vals))
+                sd = float(np.std(vals))
+            else:
+                mu = 0.0
+                sd = 1.0
+            if sd <= 1e-8:
+                sd = 1.0
+
+        z = (x - mu) / sd
+        z = np.clip(z, -z_clip, z_clip)
+        y = (z + z_clip) / (2.0 * z_clip)
+        out[name] = y.astype(np.float32, copy=False)
+
+    return out
 
 
 def _compute_tissue_mask(img, white_thresh: float = 0.92):
@@ -170,6 +262,53 @@ def _compute_tissue_mask(img, white_thresh: float = 0.92):
     mask = ndimage.binary_closing(mask, structure=np.ones((5, 5), dtype=bool))
     mask = ndimage.binary_fill_holes(mask)
     return mask
+
+
+def _compute_cell_mask_weak(
+    img,
+    tissue_mask=None,
+    dilate_radius: int = 6,
+    min_size: int = 64,
+):
+    try:
+        from skimage.color import rgb2hed
+        from skimage.filters import threshold_otsu
+        from skimage.morphology import remove_small_objects, closing, opening, disk, dilation
+        import scipy.ndimage as ndimage
+    except Exception:
+        return None
+
+    arr = np.asarray(img.convert("RGB"), dtype=np.float32) / 255.0
+    hed = rgb2hed(arr)
+    h = hed[:, :, 0].astype(np.float32, copy=False)
+    h = h - float(np.min(h))
+    denom = float(np.max(h))
+    if denom > 1e-8:
+        h = h / denom
+    else:
+        return None
+
+    try:
+        t = float(threshold_otsu(h))
+    except Exception:
+        t = 0.5
+
+    nuclei = h > t
+    nuclei = remove_small_objects(nuclei, max_size=int(max(1, min_size)))
+    nuclei = opening(nuclei, footprint=disk(1))
+    nuclei = closing(nuclei, footprint=disk(2))
+    nuclei = ndimage.binary_fill_holes(nuclei)
+
+    r = int(max(0, dilate_radius))
+    if r > 0:
+        cells = dilation(nuclei, footprint=disk(r))
+    else:
+        cells = nuclei
+
+    if tissue_mask is not None:
+        cells = cells & tissue_mask.astype(bool, copy=False)
+
+    return cells.astype(bool, copy=False)
 
 
 def extract_features(img_tensor):
@@ -795,47 +934,75 @@ def predict_spatial_distribution_hex(
 
 
 def render_single_marker_fluorescent(spatial_map, marker, tissue_mask=None, threshold_percentile: float = 80.0):
+    """
+    渲染单个标志物的荧光图像 - 高对比度CODEX风格
+    
+    特点：
+    - 纯黑背景
+    - 高亮度的稀疏信号点
+    - 真实的发光效果
+    """
     import scipy.ndimage as ndimage
+    
     spatial_dist = np.clip(spatial_map.astype(np.float32, copy=False), 0, 1)
     if tissue_mask is not None:
         spatial_dist = spatial_dist * tissue_mask.astype(np.float32, copy=False)
 
+    # 更激进的阈值处理 - 只保留高表达区域
     mask_vals = spatial_dist[tissue_mask] if tissue_mask is not None else spatial_dist[spatial_dist > 0]
     if mask_vals.size:
         p = float(np.clip(threshold_percentile, 0.0, 99.9))
         t = float(np.percentile(mask_vals, p))
-        spatial_dist = np.clip(spatial_dist - t, 0, None)
+        # 使用软阈值过渡
+        spatial_dist = np.clip((spatial_dist - t) / (1 - t + 1e-8), 0, 1)
 
-    spatial_dist = np.power(spatial_dist, 0.6)
-    spatial_dist = spatial_dist ** 0.8
-    spatial_dist = ndimage.gaussian_filter(spatial_dist, sigma=1.2)
+    # 激进的gamma校正 - 增强亮点、压暗低值
+    spatial_dist = np.power(spatial_dist, 0.4)  # 更激进的gamma
+    
+    # 高斯模糊模拟荧光扩散 - 更小的sigma保持信号点清晰
+    spatial_dist = ndimage.gaussian_filter(spatial_dist, sigma=0.8)
+    
+    # 二次gamma增强对比度
+    spatial_dist = np.power(spatial_dist, 0.7)
+    
     if tissue_mask is not None:
         spatial_dist = spatial_dist * tissue_mask.astype(np.float32, copy=False)
 
+    # 获取颜色
     color = FLUORESCENT_COLORS.get(marker, (255, 255, 255))
     r, g, b = color[2], color[1], color[0]
-    brightness = 1.6
+    
+    # 高亮度因子 - 模拟真实荧光的明亮度
+    brightness = 2.5
 
+    # 创建RGB图像
     rgb = np.zeros((spatial_dist.shape[0], spatial_dist.shape[1], 3), dtype=np.float32)
     rgb[:, :, 0] = spatial_dist * r * brightness / 255.0
     rgb[:, :, 1] = spatial_dist * g * brightness / 255.0
     rgb[:, :, 2] = spatial_dist * b * brightness / 255.0
 
-    bloom = np.zeros_like(rgb)
+    # 发光效果 (Bloom) - 小范围强发光
+    bloom_small = np.zeros_like(rgb)
     for c in range(3):
-        bloom[:, :, c] = ndimage.gaussian_filter(rgb[:, :, c], sigma=5)
-    rgb = rgb + bloom * 0.3
+        bloom_small[:, :, c] = ndimage.gaussian_filter(rgb[:, :, c], sigma=2)
+    
+    # 大范围柔光
+    bloom_large = np.zeros_like(rgb)
+    for c in range(3):
+        bloom_large[:, :, c] = ndimage.gaussian_filter(rgb[:, :, c], sigma=8)
+    
+    # 混合发光效果
+    rgb = rgb + bloom_small * 0.5 + bloom_large * 0.15
 
+    # 归一化 - 确保黑背景和高亮前景
     max_val = float(np.max(rgb))
     if max_val > 0:
+        # 非线性映射 - 增强对比度
         for c in range(3):
-            channel = np.clip(rgb[:, :, c], 0, max_val)
-            nonzero = channel[channel > 0]
-            min_v = float(np.percentile(nonzero, 5)) if nonzero.size else 0.0
-            max_v = float(np.percentile(channel, 99.5))
-            if max_v > min_v:
-                channel = (channel - min_v) / (max_v - min_v)
-            rgb[:, :, c] = channel
+            channel = rgb[:, :, c]
+            # 使用gamma映射增强
+            channel = np.power(channel / max_val, 0.8)
+            rgb[:, :, c] = np.clip(channel, 0, 1)
 
     rgb = np.clip(rgb * 255, 0, 255).astype(np.uint8)
     return Image.fromarray(rgb, "RGB")
@@ -843,23 +1010,13 @@ def render_single_marker_fluorescent(spatial_map, marker, tissue_mask=None, thre
 
 def generate_spatial_fluorescent(img, spatial_maps, selected_markers=None, alpha=0.6, tissue_mask=None, threshold_percentile: float = 80.0):
     """
-    基于空间分布图生成真实感荧光叠加图像
+    基于空间分布图生成真实感荧光叠加图像 - 高对比度CODEX风格
     
     模拟真实CODEX多通道免疫荧光成像效果：
-    - 黑色背景（无信号区域）
-    - 高对比度明亮荧光
-    - 多通道颜色混合
-    - 发光/晕染效果
-    
-    Args:
-        img: 原始H&E图像 (PIL Image)
-        spatial_maps: 空间分布图字典 {marker_name: 2D array}
-        selected_markers: 选中的标记物
-        alpha: 叠加透明度
-    
-    Returns:
-        overlay_img: 叠加后的图像
-        fluorescent_only: 仅荧光层图像
+    - 纯黑色背景（无信号区域）
+    - 高对比度明亮荧光信号
+    - 稀疏的亮点分布
+    - 真实的发光效果
     """
     import scipy.ndimage as ndimage
     
@@ -871,10 +1028,10 @@ def generate_spatial_fluorescent(img, spatial_maps, selected_markers=None, alpha
     if tissue_mask is None:
         tissue_mask = _compute_tissue_mask(img, white_thresh=0.92)
     
-    # 创建RGBA荧光图像（黑色背景）
-    fluorescent_rgba = np.zeros((height, width, 4), dtype=np.float32)
+    # 创建RGB荧光图像（黑色背景）
+    fluorescent_rgb = np.zeros((height, width, 3), dtype=np.float32)
     
-    # 为每个标志物创建独立的荧光通道
+    # 为每个标志物创建独立的荧光通道并累加
     for marker in selected_markers:
         if marker not in spatial_maps:
             continue
@@ -884,82 +1041,70 @@ def generate_spatial_fluorescent(img, spatial_maps, selected_markers=None, alpha
         if tissue_mask is not None:
             spatial_dist = spatial_dist * tissue_mask.astype(np.float32, copy=False)
 
+        # 激进的阈值处理 - 只保留高表达区域
         mask_vals = spatial_dist[tissue_mask] if tissue_mask is not None else spatial_dist[spatial_dist > 0]
         if mask_vals.size:
-            p = float(np.clip(threshold_percentile, 0.0, 99.9))
-            t = float(np.percentile(mask_vals, p))
-            spatial_dist = np.clip(spatial_dist - t, 0, None)
+            t = float(np.percentile(mask_vals, threshold_percentile))
+            spatial_dist = np.clip((spatial_dist - t) / (1 - t + 1e-8), 0, 1)
         
-        # 获取该标志物的荧光颜色 (BGR -> RGB)
-        color = FLUORESCENT_COLORS.get(marker, (255, 255, 255))
-        r, g, b = color[2], color[1], color[0]  # 转换为RGB
+        # 激进的gamma校正 - 增强亮点、压暗低值
+        spatial_dist = np.power(spatial_dist, 0.4)
         
-        # 增强对比度 - 使用非线性映射
-        # 真实荧光信号是指数响应的
-        spatial_dist = np.power(spatial_dist, 0.6)  # gamma校正增强低值
-        spatial_dist = spatial_dist ** 0.8  # 进一步增强
+        # 小范围模糊保持信号点清晰
+        spatial_dist = ndimage.gaussian_filter(spatial_dist, sigma=0.8)
         
-        # 应用高斯模糊模拟荧光扩散效果
-        spatial_dist = ndimage.gaussian_filter(spatial_dist, sigma=1.2)
+        # 二次增强
+        spatial_dist = np.power(spatial_dist, 0.7)
+        
         if tissue_mask is not None:
             spatial_dist = spatial_dist * tissue_mask.astype(np.float32, copy=False)
         
-        # 增强亮度
-        brightness = 1.5
+        # 获取该标志物的荧光颜色
+        color = FLUORESCENT_COLORS.get(marker, (255, 255, 255))
+        r, g, b = color[2], color[1], color[0]  # 转换为RGB
         
-        # 累加到荧光图像（使用加法混合模式，模拟真实荧光叠加）
-        fluorescent_rgba[:, :, 0] += spatial_dist * r * brightness / 255.0  # R
-        fluorescent_rgba[:, :, 1] += spatial_dist * g * brightness / 255.0  # G
-        fluorescent_rgba[:, :, 2] += spatial_dist * b * brightness / 255.0  # B
-        fluorescent_rgba[:, :, 3] += spatial_dist * 255  # Alpha
+        # 高亮度因子
+        brightness = 2.5
+        
+        # 累加到荧光图像（加法混合模式 - 模拟真实荧光叠加）
+        fluorescent_rgb[:, :, 0] += spatial_dist * r * brightness / 255.0
+        fluorescent_rgb[:, :, 1] += spatial_dist * g * brightness / 255.0
+        fluorescent_rgb[:, :, 2] += spatial_dist * b * brightness / 255.0
     
-    # 应用发光效果（bloom effect）
-    # 创建一个模糊版本用于发光
-    bloom = np.zeros_like(fluorescent_rgba[:, :, :3])
+    # 发光效果 (Bloom)
+    # 小范围强发光
+    bloom_small = np.zeros_like(fluorescent_rgb)
     for c in range(3):
-        bloom[:, :, c] = ndimage.gaussian_filter(fluorescent_rgba[:, :, c], sigma=5)
+        bloom_small[:, :, c] = ndimage.gaussian_filter(fluorescent_rgb[:, :, c], sigma=2)
     
-    # 将发光效果加回原图
+    # 大范围柔光
+    bloom_large = np.zeros_like(fluorescent_rgb)
     for c in range(3):
-        fluorescent_rgba[:, :, c] = fluorescent_rgba[:, :, c] + bloom[:, :, c] * 0.3
+        bloom_large[:, :, c] = ndimage.gaussian_filter(fluorescent_rgb[:, :, c], sigma=8)
+    
+    # 混合发光效果
+    fluorescent_rgb = fluorescent_rgb + bloom_small * 0.5 + bloom_large * 0.15
 
+    # 应用组织mask
     if tissue_mask is not None:
         m = tissue_mask.astype(np.float32, copy=False)
-        fluorescent_rgba[:, :, 0] *= m
-        fluorescent_rgba[:, :, 1] *= m
-        fluorescent_rgba[:, :, 2] *= m
-        fluorescent_rgba[:, :, 3] *= m
-    
-    # 归一化并增强对比度
-    max_val = np.max(fluorescent_rgba[:, :, :3])
-    if max_val > 0:
-        # 使用自适应对比度增强
         for c in range(3):
-            channel = fluorescent_rgba[:, :, c]
-            # 裁剪并增强
-            channel = np.clip(channel, 0, max_val)
-            # 直方图拉伸
-            min_v = np.percentile(channel[channel > 0], 5) if np.any(channel > 0) else 0
-            max_v = np.percentile(channel, 99.5)
-            if max_v > min_v:
-                channel = (channel - min_v) / (max_v - min_v)
-            fluorescent_rgba[:, :, c] = channel
+            fluorescent_rgb[:, :, c] *= m
+
+    # 归一化 - 确保黑背景和高亮前景
+    max_val = float(np.max(fluorescent_rgb))
+    if max_val > 0:
+        for c in range(3):
+            channel = fluorescent_rgb[:, :, c]
+            # 使用gamma映射增强对比度
+            channel = np.power(channel / max_val, 0.8)
+            fluorescent_rgb[:, :, c] = np.clip(channel, 0, 1)
     
-    # 创建仅荧光图像（黑色背景）
-    fluorescent_rgb = fluorescent_rgba[:, :, :3].copy()
+    # 转换为8位图像
     fluorescent_rgb = np.clip(fluorescent_rgb * 255, 0, 255).astype(np.uint8)
-    
-    # 应用alpha通道作为亮度mask
-    alpha_mask = fluorescent_rgba[:, :, 3:4].copy()
-    alpha_mask = np.clip(alpha_mask / alpha_mask.max() if alpha_mask.max() > 0 else alpha_mask, 0, 1)
-    
-    # 增强荧光区域的亮度
-    for c in range(3):
-        fluorescent_rgb[:, :, c] = (fluorescent_rgb[:, :, c] * (0.3 + 0.7 * alpha_mask[:, :, 0])).astype(np.uint8)
-    
     fluorescent_only = Image.fromarray(fluorescent_rgb, 'RGB')
-    
-    # 创建叠加图像
+
+    # 创建叠加图像 - 使用屏幕混合模式
     he_array = np.array(img).astype(np.float32) / 255.0
     
     # 将H&E转换为灰度作为背景
@@ -1087,6 +1232,16 @@ def generate_fluorescent():
         output_dir = data.get('output_dir', None)
         job_id = data.get('job_id', None)
         transparent_alpha_floor = float(data.get('transparent_alpha_floor', 0.0))
+        psf_sigma = float(data.get('psf_sigma', 0.0))
+        poisson_scale = float(data.get('poisson_scale', 0.0))
+        background_noise_sigma = float(data.get('background_noise_sigma', 0.0))
+        noise_seed = data.get('noise_seed', None)
+        channel_norm = data.get('channel_norm', 'none')
+        channel_ref_stats = data.get('channel_ref_stats', None)
+        z_clip = float(data.get('z_clip', 3.0))
+        segmentation_mode = str(data.get('segmentation_mode', 'none')).strip().lower()
+        seg_dilate = int(data.get('seg_dilate', 6))
+        seg_min_size = int(data.get('seg_min_size', 64))
 
         if mode == "hex" and (output_dir is None or str(output_dir).strip() == ""):
             output_dir = "/home/acproject/workspace/python_projects/HEX/bridge_out_web"
@@ -1133,30 +1288,76 @@ def generate_fluorescent():
             
             # 生成荧光叠加
             tissue_mask = _compute_tissue_mask(img_infer, white_thresh=0.92)
-            if tissue_mask is not None and np.any(tissue_mask):
-                predictions = {m: float(np.mean(spatial_maps[m][tissue_mask])) for m in spatial_maps}
+            cell_mask = None
+            if segmentation_mode == "weak":
+                cell_mask = _compute_cell_mask_weak(
+                    img_infer,
+                    tissue_mask=tissue_mask,
+                    dilate_radius=seg_dilate,
+                    min_size=seg_min_size,
+                )
+            combined_mask = cell_mask if cell_mask is not None else tissue_mask
+            if channel_norm == "zscore":
+                spatial_maps = _normalize_spatial_maps_zscore(
+                    spatial_maps,
+                    tissue_mask=combined_mask,
+                    ref_stats=channel_ref_stats,
+                    z_clip=z_clip,
+                )
+            if combined_mask is not None and np.any(combined_mask):
+                predictions = {m: float(np.mean(spatial_maps[m][combined_mask])) for m in spatial_maps}
             result, fluorescent_only = generate_spatial_fluorescent(
                 img_infer,
                 spatial_maps, 
                 selected_markers, 
                 alpha,
-                tissue_mask=tissue_mask,
+                tissue_mask=combined_mask,
                 threshold_percentile=threshold_percentile,
             )
-            per_marker_images_pil = {m: render_single_marker_fluorescent(spatial_maps[m], m, tissue_mask=tissue_mask, threshold_percentile=threshold_percentile) for m in selected_markers if m in spatial_maps}
+            per_marker_images_pil = {m: render_single_marker_fluorescent(spatial_maps[m], m, tissue_mask=combined_mask, threshold_percentile=threshold_percentile) for m in selected_markers if m in spatial_maps}
 
             if result.size != display_size:
                 result = result.resize(display_size, Image.LANCZOS)
                 fluorescent_only = fluorescent_only.resize(display_size, Image.LANCZOS)
                 per_marker_images_pil = {m: im.resize(display_size, Image.LANCZOS) for m, im in per_marker_images_pil.items()}
 
+            tissue_mask = _compute_tissue_mask(img_display, white_thresh=0.92)
+            cell_mask = None
+            if segmentation_mode == "weak":
+                cell_mask = _compute_cell_mask_weak(
+                    img_display,
+                    tissue_mask=tissue_mask,
+                    dilate_radius=seg_dilate,
+                    min_size=seg_min_size,
+                )
+            combined_mask = cell_mask if cell_mask is not None else tissue_mask
+
+            fluorescent_only = _apply_psf_and_noise_rgb(
+                fluorescent_only,
+                psf_sigma=psf_sigma,
+                poisson_scale=poisson_scale,
+                background_noise_sigma=background_noise_sigma,
+                seed=int(noise_seed) if noise_seed is not None else None,
+            )
+            per_marker_images_pil = {
+                m: _apply_psf_and_noise_rgb(
+                    im,
+                    psf_sigma=psf_sigma,
+                    poisson_scale=poisson_scale,
+                    background_noise_sigma=background_noise_sigma,
+                    seed=int(noise_seed) if noise_seed is not None else None,
+                )
+                for m, im in per_marker_images_pil.items()
+            }
+
             fluorescent_only_rgba = _rgb_black_to_transparent_rgba(
                 fluorescent_only,
                 alpha_floor=transparent_alpha_floor,
                 alpha_gamma=1.0,
+                alpha_mask=combined_mask,
             )
             per_marker_images_pil = {
-                m: _rgb_black_to_transparent_rgba(im, alpha_floor=transparent_alpha_floor, alpha_gamma=1.0)
+                m: _rgb_black_to_transparent_rgba(im, alpha_floor=transparent_alpha_floor, alpha_gamma=1.0, alpha_mask=combined_mask)
                 for m, im in per_marker_images_pil.items()
             }
 
@@ -1253,13 +1454,32 @@ def generate_fluorescent():
                 fluorescent_only = fluorescent_only.resize(display_size, Image.LANCZOS)
                 per_marker_images_pil = {m: im.resize(display_size, Image.LANCZOS) for m, im in per_marker_images_pil.items()}
 
+            fluorescent_only = _apply_psf_and_noise_rgb(
+                fluorescent_only,
+                psf_sigma=psf_sigma,
+                poisson_scale=poisson_scale,
+                background_noise_sigma=background_noise_sigma,
+                seed=int(noise_seed) if noise_seed is not None else None,
+            )
+            per_marker_images_pil = {
+                m: _apply_psf_and_noise_rgb(
+                    im,
+                    psf_sigma=psf_sigma,
+                    poisson_scale=poisson_scale,
+                    background_noise_sigma=background_noise_sigma,
+                    seed=int(noise_seed) if noise_seed is not None else None,
+                )
+                for m, im in per_marker_images_pil.items()
+            }
+
             fluorescent_only_rgba = _rgb_black_to_transparent_rgba(
                 fluorescent_only,
                 alpha_floor=transparent_alpha_floor,
                 alpha_gamma=1.0,
+                alpha_mask=combined_mask,
             )
             per_marker_images_pil = {
-                m: _rgb_black_to_transparent_rgba(im, alpha_floor=transparent_alpha_floor, alpha_gamma=1.0)
+                m: _rgb_black_to_transparent_rgba(im, alpha_floor=transparent_alpha_floor, alpha_gamma=1.0, alpha_mask=combined_mask)
                 for m, im in per_marker_images_pil.items()
             }
 

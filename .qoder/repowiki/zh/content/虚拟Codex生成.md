@@ -15,15 +15,18 @@
 - [extract_he_patch.py](file://extract_he_patch.py)
 - [extract_marker_info_patch.py](file://extract_marker_info_patch.py)
 - [README.md](file://README.md)
+- [app.py](file://webapp/app.py)
 </cite>
 
 ## 更新摘要
 **变更内容**
 - 新增完整的H&E到CODEX转换预测管道，包括新的predict_he_to_codex_h5.py脚本
+- 显著增强的虚拟Codex生成功能，包括新的荧光渲染引擎、组织掩码算法和多生物标志物通道支持
 - 改进的虚拟Codex生成流程，支持WSI和普通图像的统一处理
 - 增强的空间坐标映射功能，支持更精确的分辨率匹配
 - 新增背景过滤和批次处理优化
 - 完善的命令行接口和批量处理能力
+- Web应用集成，提供交互式可视化界面
 
 ## 目录
 1. [引言](#引言)
@@ -38,10 +41,10 @@
 10. [附录](#附录)
 
 ## 引言
-本文件围绕HEX项目的"虚拟Codex生成"能力，系统化梳理从H&E图像到蛋白质表达图谱的完整转换流程、空间坐标映射与分辨率匹配策略、H5数据处理与批量读取优化、质量控制与验证方法，以及完整的数据格式转换示例与性能优化建议。本次更新重点介绍了新增的H&E到CODEX转换预测管道，包括完整的命令行接口、背景过滤、批次处理和多格式支持。
+本文件围绕HEX项目的"虚拟Codex生成"能力，系统化梳理从H&E图像到蛋白质表达图谱的完整转换流程、空间坐标映射与分辨率匹配策略、H5数据处理与批量读取优化、质量控制与验证方法，以及完整的数据格式转换示例与性能优化建议。本次更新重点介绍了新增的H&E到CODEX转换预测管道，包括完整的命令行接口、背景过滤、批次处理和多格式支持，以及显著增强的荧光渲染引擎和组织掩码算法。
 
 ## 项目结构
-HEX项目采用模块化组织：HEX侧负责基于H&E图像的多标志物回归模型训练与推理；MICA侧负责将HEX生成的虚拟Codex与WSI Bag特征融合进行生存分析建模。虚拟Codex生成的核心脚本位于hex与mica两个子目录中，分别承担H5→图像与图像→特征袋的任务。
+HEX项目采用模块化组织：HEX侧负责基于H&E图像的多标志物回归模型训练与推理；MICA侧负责将HEX生成的虚拟Codex与WSI Bag特征融合进行生存分析建模。虚拟Codex生成的核心脚本位于hex与mica两个子目录中，分别承担H5→图像与图像→特征袋的任务。Web应用提供交互式可视化界面。
 
 ```mermaid
 graph TB
@@ -63,6 +66,10 @@ J["提取H&E补丁<br/>extract_he_patch.py"]
 K["提取CODEX通道强度<br/>extract_marker_info_patch.py"]
 L["虚拟Codex生成H5→图像<br/>hex/virtual_codex_from_h5.py"]
 end
+subgraph "Web应用可视化"
+M["Flask Web应用<br/>webapp/app.py"]
+N["交互式界面<br/>webapp/templates/index.html"]
+end
 J --> K
 K --> B
 B --> E
@@ -70,6 +77,8 @@ E --> L
 L --> F
 F --> G
 G --> H
+M --> E
+M --> L
 ```
 
 **图表来源**
@@ -77,7 +86,7 @@ G --> H
 - [train_dist_codex_lung_marker.py:1-400](file://hex/train_dist_codex_lung_marker.py#L1-L400)
 - [test_codex_lung_marker.py:1-197](file://hex/test_codex_lung_marker.py#L1-L197)
 - [utils.py:1-342](file://hex/utils.py#L1-L342)
-- [predict_he_to_codex_h5.py:1-509](file://hex/predict_he_to_codex_h5.py#L1-L509)
+- [predict_he_to_codex_h5.py:1-841](file://hex/predict_he_to_codex_h5.py#L1-L841)
 - [codex_h5_png2fea.py:1-173](file://mica/codex_h5_png2fea.py#L1-L173)
 - [dataset.py:1-250](file://mica/dataset.py#L1-L250)
 - [core_utils.py:1-230](file://mica/core_utils.py#L1-L230)
@@ -85,6 +94,7 @@ G --> H
 - [extract_he_patch.py:1-78](file://extract_he_patch.py#L1-L78)
 - [extract_marker_info_patch.py:1-74](file://extract_marker_info_patch.py#L1-L74)
 - [virtual_codex_from_h5.py:1-68](file://hex/virtual_codex_from_h5.py#L1-L68)
+- [app.py:1-1405](file://webapp/app.py#L1-L1405)
 
 **章节来源**
 - [README.md:1-57](file://README.md#L1-L57)
@@ -92,7 +102,10 @@ G --> H
 ## 核心组件
 - **H&E到CODEX转换预测管道**
   - 功能：完整的端到端预测管道，支持WSI和普通图像，自动背景过滤，批次处理，多格式输出
-  - 关键特性：自动设备检测、批量推理、背景区域过滤、H5和NPZ格式输出
+  - 关键特性：自动设备检测、批量推理、背景区域过滤、H5和NPZ格式输出、多生物标志物通道支持
+- **增强的荧光渲染引擎**
+  - 功能：基于真实免疫荧光成像原理的多通道渲染，支持组织掩码、阈值处理、高斯模糊和发光效果
+  - 关键特性：40种生物标志物颜色映射、组织特异性表达、真实感视觉效果
 - **虚拟Codex生成（H5→图像）**
   - 功能：将每个WSI对应的H5文件中的预测向量与坐标映射到统一分辨率的二维图像，保存为npy格式
   - 关键点：基于OpenSlide读取WSI元数据推断放大倍数，计算缩放因子，按坐标落格累加至codex图像
@@ -102,18 +115,21 @@ G --> H
   - 功能：以H&E补丁为输入，回归40个蛋白标志物表达，支持分布式训练与评估
 - **MICA生存分析融合**
   - 功能：将WSI Bag特征与虚拟Codex深度特征融合，进行生存分析建模与可解释性分析
+- **Web应用可视化**
+  - 功能：提供交互式界面，支持实时荧光渲染、组织掩码分析和多生物标志物可视化
 
 **章节来源**
-- [predict_he_to_codex_h5.py:1-509](file://hex/predict_he_to_codex_h5.py#L1-L509)
+- [predict_he_to_codex_h5.py:1-841](file://hex/predict_he_to_codex_h5.py#L1-L841)
 - [virtual_codex_from_h5.py:1-68](file://hex/virtual_codex_from_h5.py#L1-L68)
 - [codex_h5_png2fea.py:1-173](file://mica/codex_h5_png2fea.py#L1-L173)
 - [hex_architecture.py:1-62](file://hex/hex_architecture.py#L1-L62)
 - [utils.py:1-342](file://hex/utils.py#L1-L342)
 - [dataset.py:1-250](file://mica/dataset.py#L1-L250)
 - [core_utils.py:1-230](file://mica/core_utils.py#L1-L230)
+- [app.py:1-1405](file://webapp/app.py#L1-L1405)
 
 ## 架构总览
-下图展示从H&E到虚拟Codex再到生存分析的整体流程，突出数据流与模块边界。
+下图展示从H&E到虚拟Codex再到生存分析的整体流程，突出数据流与模块边界，包括新增的Web应用集成。
 
 ```mermaid
 sequenceDiagram
@@ -126,6 +142,7 @@ participant IMG as "图像生成"
 participant FEAT as "特征提取"
 participant DATASET as "数据集加载"
 participant TRAIN as "训练/验证"
+participant WEB as "Web应用"
 HE->>PREP : 提取H&E补丁与CODEX通道强度
 PREP-->>HEX : 训练数据补丁+通道强度
 HEX-->>PIPE : H&E图像→CODEX预测
@@ -134,17 +151,20 @@ H5GEN->>IMG : 将H5映射为codex图像npy
 IMG->>FEAT : 按通道切片并用DINOv2提取特征
 FEAT->>DATASET : 写入features.h5
 DATASET->>TRAIN : 加载特征与标签，训练MICA
+PIPE->>WEB : 提供交互式可视化
+WEB->>PIPE : 用户选择生物标志物和参数
 ```
 
 **图表来源**
 - [extract_he_patch.py:1-78](file://extract_he_patch.py#L1-L78)
 - [extract_marker_info_patch.py:1-74](file://extract_marker_info_patch.py#L1-L74)
 - [train_dist_codex_lung_marker.py:1-400](file://hex/train_dist_codex_lung_marker.py#L1-L400)
-- [predict_he_to_codex_h5.py:1-509](file://hex/predict_he_to_codex_h5.py#L1-L509)
+- [predict_he_to_codex_h5.py:1-841](file://hex/predict_he_to_codex_h5.py#L1-L841)
 - [virtual_codex_from_h5.py:1-68](file://hex/virtual_codex_from_h5.py#L1-L68)
 - [codex_h5_png2fea.py:1-173](file://mica/codex_h5_png2fea.py#L1-L173)
 - [dataset.py:1-250](file://mica/dataset.py#L1-L250)
 - [core_utils.py:1-230](file://mica/core_utils.py#L1-L230)
+- [app.py:1-1405](file://webapp/app.py#L1-L1405)
 
 ## 详细组件分析
 
@@ -158,10 +178,12 @@ DATASET->>TRAIN : 加载特征与标签，训练MICA
   - 批次网格扫描：支持自定义patch_size和stride
   - 背景过滤：基于白色阈值过滤无意义区域
   - 多格式输出：支持H5、NPZ、Numpy网格三种格式
+  - **新增**：多生物标志物通道渲染，支持40种生物标志物的独立可视化
 - **处理流程**
   - 图像预处理：Resize(384,384)、ToTensor、Normalize
   - 模型推理：自动混合精度推理，支持GPU加速
   - 结果保存：动态H5创建，支持增量写入
+  - **新增**：组织掩码计算，背景过滤，荧光渲染
 
 ```mermaid
 flowchart TD
@@ -179,18 +201,57 @@ Inference --> OutputFormat{"输出格式?"}
 OutputFormat --> |H5| SaveH5["保存H5(coords, codex_prediction)"]
 OutputFormat --> |NPZ| SaveNPZ["保存NPZ(coords, codex_prediction)"]
 OutputFormat --> |Numpy| SaveNumpy["保存Numpy网格"]
-SaveH5 --> End(["完成"])
+SaveH5 --> FluorescentRender["荧光渲染引擎"]
+FluorescentRender --> End(["完成"])
 SaveNPZ --> End
 SaveNumpy --> End
 ```
 
 **图表来源**
-- [predict_he_to_codex_h5.py:1-509](file://hex/predict_he_to_codex_h5.py#L1-L509)
+- [predict_he_to_codex_h5.py:1-841](file://hex/predict_he_to_codex_h5.py#L1-L841)
 
 **章节来源**
-- [predict_he_to_codex_h5.py:1-509](file://hex/predict_he_to_codex_h5.py#L1-L509)
+- [predict_he_to_codex_h5.py:1-841](file://hex/predict_he_to_codex_h5.py#L1-L841)
 
-### 组件B：虚拟Codex生成（H5→图像）
+### 组件B：增强的荧光渲染引擎
+- **多生物标志物通道支持**
+  - 支持40种生物标志物的独立可视化
+  - 每种标志物具有特定的荧光颜色映射
+  - 组织特异性表达模式模拟
+- **组织掩码算法**
+  - HSV色彩空间分析识别组织区域
+  - 二值化闭合和孔洞填充处理
+  - 组织掩码应用于所有渲染通道
+- **真实感渲染效果**
+  - 高斯模糊模拟荧光扩散
+  - 发光(bloom)效果增强视觉效果
+  - 阈值处理和对比度增强
+  - alpha通道混合实现透明度效果
+
+```mermaid
+flowchart TD
+Start(["开始渲染"]) --> ComputeMask["计算组织掩码(HSV)"]
+ComputeMask --> ProcessMarkers["处理每个生物标志物"]
+ProcessMarkers --> Threshold["阈值处理(percentile)"]
+Threshold --> Gamma["Gamma校正(0.6, 0.8)"]
+Gamma --> Gaussian["高斯模糊(sigma=1.2)"]
+Gaussian --> ColorMap["颜色映射(BGR->RGB)"]
+ColorMap --> Accumulate["累加到RGB图像"]
+Accumulate --> Bloom["发光效果(bloom)"]
+Bloom --> Normalize["自适应对比度增强"]
+Normalize --> MaskApply["应用组织掩码"]
+MaskApply --> Output(["输出荧光图像"])
+```
+
+**图表来源**
+- [predict_he_to_codex_h5.py:133-244](file://hex/predict_he_to_codex_h5.py#L133-L244)
+- [app.py:844-978](file://webapp/app.py#L844-L978)
+
+**章节来源**
+- [predict_he_to_codex_h5.py:133-244](file://hex/predict_he_to_codex_h5.py#L133-L244)
+- [app.py:844-978](file://webapp/app.py#L844-L978)
+
+### 组件C：虚拟Codex生成（H5→图像）
 - **输入**
   - H5文件：包含两组键值
     - codex_prediction：形状(N, C)，N为采样点数，C为通道数（40或与模型一致）
@@ -229,7 +290,7 @@ Next --> Done(["完成并保存npy"])
 **章节来源**
 - [virtual_codex_from_h5.py:1-68](file://hex/virtual_codex_from_h5.py#L1-L68)
 
-### 组件C：图像→特征袋（DINOv2）
+### 组件D：图像→特征袋（DINOv2）
 - **数据准备**
   - 读取每个WSI的codex图像（npy），逐通道转为RGB单通道图
   - 使用DataLoader批量化加载，支持多进程与pin_memory
@@ -258,7 +319,7 @@ NET-->>H5 : 按图像名写入特征矩阵
 **章节来源**
 - [codex_h5_png2fea.py:1-173](file://mica/codex_h5_png2fea.py#L1-L173)
 
-### 组件D：HEX多标志物回归（训练与测试）
+### 组件E：HEX多标志物回归（训练与测试）
 - **模型架构**
   - 视觉编码器来自MUSK，回归头由两段线性层+激活+Dropout组成
   - 支持FDS平滑（分桶统计+核平滑）提升小样本稳定性
@@ -305,7 +366,7 @@ CustomModel --> PatchDataset : "训练/验证时加载"
 - [train_dist_codex_lung_marker.py:1-400](file://hex/train_dist_codex_lung_marker.py#L1-L400)
 - [test_codex_lung_marker.py:1-197](file://hex/test_codex_lung_marker.py#L1-L197)
 
-### 组件E：MICA生存分析融合
+### 组件F：MICA生存分析融合
 - **数据集加载**
   - 从H5读取每个slide的虚拟Codex深度特征，拼接WSI Bag特征
 - **训练/验证**
@@ -335,6 +396,37 @@ CORE->>MODEL : 训练循环与验证
 - [core_utils.py:1-230](file://mica/core_utils.py#L1-L230)
 - [utils.py（MICA）:1-273](file://mica/utils.py#L1-L273)
 
+### 组件G：Web应用可视化
+- **交互式界面**
+  - 实时生物标志物选择和参数调整
+  - 荧光渲染效果预览
+  - 组织掩码分析可视化
+- **核心功能**
+  - 生物标志物分类和推荐
+  - 参数调节（alpha透明度、稀疏百分比）
+  - 多种渲染模式支持
+- **技术实现**
+  - Flask后端提供API接口
+  - HTML/CSS/JavaScript前端界面
+  - Canvas绘图实现实时渲染
+
+```mermaid
+flowchart TD
+WebApp["Web应用启动"] --> LoadModels["加载HEX/MUSK模型"]
+LoadModels --> UI["渲染用户界面"]
+UI --> UserInput["用户输入(图像/参数)"]
+UserInput --> Process["处理请求"]
+Process --> Render["生成荧光渲染"]
+Render --> Display["显示结果"]
+Display --> Download["下载结果"]
+```
+
+**图表来源**
+- [app.py:1-1405](file://webapp/app.py#L1-L1405)
+
+**章节来源**
+- [app.py:1-1405](file://webapp/app.py#L1-L1405)
+
 ## 依赖分析
 - **外部库**
   - openslide：读取WSI元数据与尺寸
@@ -344,10 +436,14 @@ CORE->>MODEL : 训练循环与验证
   - palom：OME金字塔读取（CODEX通道强度）
   - timm：图像预处理标准化
   - numpy：数值计算与数组操作
+  - **新增**：cv2：计算机视觉处理（HSV转换、图像处理）
+  - **新增**：scipy.ndimage：科学计算与图像滤波
+  - **新增**：flask：Web应用框架
 - **模块耦合**
   - HEX与MICA通过H5文件衔接，形成"图像→特征袋"的数据桥
   - 预处理脚本为HEX训练提供配对数据（H&E补丁+CODEX通道强度）
   - 新增的预测管道作为HEX推理的统一入口
+  - **新增**：Web应用提供交互式可视化界面
 
 ```mermaid
 graph LR
@@ -360,19 +456,24 @@ dinov2["DINOv2"] --> FEAT
 palom["palom"] --> PREP["预处理脚本"]
 timm["timm"] --> PIPE["预测管道"]
 numpy["numpy"] --> PIPE
+cv2["cv2"] --> PIPE
+ndimage["scipy.ndimage"] --> PIPE
+flask["flask"] --> WEB["Web应用"]
 ```
 
 **图表来源**
 - [virtual_codex_from_h5.py:1-68](file://hex/virtual_codex_from_h5.py#L1-L68)
 - [codex_h5_png2fea.py:1-173](file://mica/codex_h5_png2fea.py#L1-L173)
 - [extract_marker_info_patch.py:1-74](file://extract_marker_info_patch.py#L1-L74)
-- [predict_he_to_codex_h5.py:1-509](file://hex/predict_he_to_codex_h5.py#L1-L509)
+- [predict_he_to_codex_h5.py:1-841](file://hex/predict_he_to_codex_h5.py#L1-L841)
+- [app.py:1-1405](file://webapp/app.py#L1-L1405)
 
 **章节来源**
 - [virtual_codex_from_h5.py:1-68](file://hex/virtual_codex_from_h5.py#L1-L68)
 - [codex_h5_png2fea.py:1-173](file://mica/codex_h5_png2fea.py#L1-L173)
 - [extract_marker_info_patch.py:1-74](file://extract_marker_info_patch.py#L1-L74)
-- [predict_he_to_codex_h5.py:1-509](file://hex/predict_he_to_codex_h5.py#L1-L509)
+- [predict_he_to_codex_h5.py:1-841](file://hex/predict_he_to_codex_h5.py#L1-L841)
+- [app.py:1-1405](file://webapp/app.py#L1-L1405)
 
 ## 性能考虑
 - **H5读取与内存占用**
@@ -382,14 +483,21 @@ numpy["numpy"] --> PIPE
   - 图像→特征袋阶段使用高batch_size与多worker，结合pin_memory加速GPU传输
   - 预处理阶段（提取H&E补丁、提取CODEX通道强度）使用多进程池并行处理
   - 新增的预测管道支持批量推理，显著提升处理效率
+  - **新增**：多生物标志物并行处理，提高渲染效率
 - **分辨率与缩放**
   - 以224为基准计算缩放因子，兼顾速度与空间分辨率
   - 坐标映射采用整除与边界裁剪，避免插值带来的模糊与额外开销
+  - **新增**：组织掩码预计算，避免重复计算
 - **背景过滤优化**
   - 基于白色阈值的快速背景检测，过滤无效区域
   - 支持最大补丁数限制，防止内存溢出
+  - **新增**：HSV色彩空间分析，提高组织识别准确性
 - **训练优化**
   - AMP混合精度、分布式训练、学习率调度与自适应损失，提升收敛稳定性与吞吐
+- **Web应用性能**
+  - **新增**：Canvas渲染优化，减少重绘开销
+  - **新增**：参数缓存，避免重复计算
+  - **新增**：异步处理，提升用户体验
 
 **章节来源**
 - [virtual_codex_from_h5.py:1-68](file://hex/virtual_codex_from_h5.py#L1-L68)
@@ -397,7 +505,8 @@ numpy["numpy"] --> PIPE
 - [extract_he_patch.py:1-78](file://extract_he_patch.py#L1-L78)
 - [extract_marker_info_patch.py:1-74](file://extract_marker_info_patch.py#L1-L74)
 - [train_dist_codex_lung_marker.py:1-400](file://hex/train_dist_codex_lung_marker.py#L1-L400)
-- [predict_he_to_codex_h5.py:1-509](file://hex/predict_he_to_codex_h5.py#L1-L509)
+- [predict_he_to_codex_h5.py:1-841](file://hex/predict_he_to_codex_h5.py#L1-L841)
+- [app.py:1-1405](file://webapp/app.py#L1-L1405)
 
 ## 故障排查指南
 - **H5文件缺失或路径错误**
@@ -421,16 +530,23 @@ numpy["numpy"] --> PIPE
 - **背景过滤问题**
   - 现象：过滤过度或不过滤
   - 排查：调整white_thresh参数，检查图像质量
+- **荧光渲染异常**
+  - **新增**：现象：渲染效果不理想或颜色异常
+  - **新增**：排查：检查生物标志物名称映射，确认阈值参数设置
+- **Web应用问题**
+  - **新增**：现象：页面加载缓慢或功能异常
+  - **新增**：排查：检查模型加载状态，确认依赖库版本兼容性
 
 **章节来源**
 - [virtual_codex_from_h5.py:1-68](file://hex/virtual_codex_from_h5.py#L1-L68)
 - [codex_h5_png2fea.py:1-173](file://mica/codex_h5_png2fea.py#L1-L173)
 - [test_codex_lung_marker.py:1-197](file://hex/test_codex_lung_marker.py#L1-L197)
 - [dataset.py:1-250](file://mica/dataset.py#L1-L250)
-- [predict_he_to_codex_h5.py:1-509](file://hex/predict_he_to_codex_h5.py#L1-L509)
+- [predict_he_to_codex_h5.py:1-841](file://hex/predict_he_to_codex_h5.py#L1-L841)
+- [app.py:1-1405](file://webapp/app.py#L1-L1405)
 
 ## 结论
-虚拟Codex生成通过H5→图像的轻量映射，将AI回归得到的蛋白质表达向量还原为空间图像，再经由图像→特征袋流程进入MICA生存分析。本次更新引入了完整的H&E到CODEX转换预测管道，提供了统一的命令行接口、智能的背景过滤、高效的批次处理和多格式输出支持。该流程在保证空间一致性的前提下，实现了高效的批量处理与可扩展的多标志物回归。配合HEX的分布式训练与MICA的融合建模，整体方案具备良好的临床转化潜力。
+虚拟Codex生成通过H5→图像的轻量映射，将AI回归得到的蛋白质表达向量还原为空间图像，再经由图像→特征袋流程进入MICA生存分析。本次更新引入了完整的H&E到CODEX转换预测管道，提供了统一的命令行接口、智能的背景过滤、高效的批次处理和多格式输出支持。**新增的显著增强功能包括：先进的荧光渲染引擎，能够模拟真实的多通道免疫荧光成像效果；改进的组织掩码算法，提供更准确的组织区域识别；全面的多生物标志物通道支持，涵盖40种不同的生物标志物。**这些增强功能使得虚拟Codex生成不仅具备了更高的视觉保真度，还提供了更强的生物学解释能力。配合HEX的分布式训练与MICA的融合建模，整体方案具备良好的临床转化潜力和用户体验。
 
 ## 附录
 
@@ -442,14 +558,17 @@ numpy["numpy"] --> PIPE
 - **中间文件**
   - codex图像：npy，形状(height,width,C)，dtype=float16
   - features.h5：键为图像名，值为形状(num_channels, feat_dim)的数组
+  - **新增**：荧光渲染图像：PNG格式，包含叠加和仅荧光两种模式
 - **输出**
   - MICA训练所需特征袋与标签
   - 预测管道输出：H5、NPZ、Numpy网格三种格式
+  - **新增**：Web应用可视化结果
 
 **章节来源**
 - [virtual_codex_from_h5.py:1-68](file://hex/virtual_codex_from_h5.py#L1-L68)
 - [codex_h5_png2fea.py:1-173](file://mica/codex_h5_png2fea.py#L1-L173)
-- [predict_he_to_codex_h5.py:1-509](file://hex/predict_he_to_codex_h5.py#L1-L509)
+- [predict_he_to_codex_h5.py:1-841](file://hex/predict_he_to_codex_h5.py#L1-L841)
+- [app.py:1-1405](file://webapp/app.py#L1-L1405)
 
 ### 空间坐标映射与分辨率匹配要点
 - **放大倍数推断**：优先使用aperio.MPP或MPP_X属性，否则回退默认值
@@ -472,12 +591,17 @@ numpy["numpy"] --> PIPE
 - **预测质量评估**
   - 新增的预测管道支持批量处理，提供进度监控和结果验证
   - 支持多种输出格式，便于后续分析和验证
+- **荧光渲染质量控制**
+  - **新增**：阈值参数敏感性分析
+  - **新增**：组织掩码准确性验证
+  - **新增**：多生物标志物一致性检查
 
 **章节来源**
 - [test_codex_lung_marker.py:1-197](file://hex/test_codex_lung_marker.py#L1-L197)
 - [utils.py:1-342](file://hex/utils.py#L1-L342)
 - [core_utils.py:1-230](file://mica/core_utils.py#L1-L230)
-- [predict_he_to_codex_h5.py:1-509](file://hex/predict_he_to_codex_h5.py#L1-L509)
+- [predict_he_to_codex_h5.py:1-841](file://hex/predict_he_to_codex_h5.py#L1-L841)
+- [app.py:1-1405](file://webapp/app.py#L1-L1405)
 
 ### 命令行接口使用示例
 - **基本WSI预测**
@@ -492,6 +616,73 @@ numpy["numpy"] --> PIPE
   ```bash
   python predict_he_to_codex_h5.py --input image.png --patch_size 256 --stride 128 --white_thresh 0.95 --clip_01
   ```
+- **荧光渲染参数**
+  ```bash
+  python predict_he_to_codex_h5.py --input slide.svs --export_png_dir ./fluorescent_output --export_markers DAPI,CD8,Pan-Cytokeratin --export_alpha 0.7 --export_sparsity_percentile 80.0
+  ```
 
 **章节来源**
-- [predict_he_to_codex_h5.py:375-509](file://hex/predict_he_to_codex_h5.py#L375-L509)
+- [predict_he_to_codex_h5.py:685-841](file://hex/predict_he_to_codex_h5.py#L685-L841)
+
+### Web应用使用指南
+- **启动Web应用**
+  ```bash
+  python webapp/app.py
+  ```
+- **访问界面**
+  - 打开浏览器访问 http://localhost:5000
+- **主要功能**
+  - 图像上传和分析
+  - 生物标志物选择和参数调节
+  - 实时荧光渲染预览
+  - 结果下载和导出
+
+**章节来源**
+- [app.py:1-1405](file://webapp/app.py#L1-L1405)
+
+### 生物标志物颜色映射表
+- **DAPI**：蓝色 - 核染色
+- **CD8**：绿色 - 细胞毒性T细胞
+- **CD3e**：青绿色 - T细胞
+- **CD4**：黄绿色 - 辅助T细胞
+- **CD20**：黄色 - B细胞
+- **CD45**：橙黄色 - 白细胞
+- **Pan-Cytokeratin**：粉红色 - 上皮细胞
+- **EpCAM**：品红色 - 上皮细胞
+- **E-cadherin**：紫色 - 上皮标记
+- **CD31**：天蓝色 - 血管内皮
+- **CD34**：浅蓝色 - 血管
+- **FAP**：橙色 - 成纤维细胞
+- **aSMA**：橙红色 - 平滑肌
+- **Collagen IV**：棕色 - 基底膜
+- **CD68**：青色 - 巨噬细胞
+- **CD163**：深青色 - M2巨噬细胞
+- **CD11c**：浅蓝色 - 树突细胞
+- **CD66b**：浅橙色 - 中性粒细胞
+- **MPO**：红色 - 髓过氧化物酶
+- **Ki67**：红色 - 增殖标记
+- **PD-1**：粉色 - 免疫检查点
+- **PD-L1**：紫红色 - 免疫检查点
+- **Granzyme B**：红色 - 细胞毒性
+- **FOXP3**：紫色 - Treg
+- **LAG3**：蓝紫色 - 免疫检查点
+- **TIM3**：紫色 - 免疫检查点
+- **VISTA**：浅蓝色 - 免疫检查点
+- **CD39**：青绿色 - 免疫检查点
+- **HLA-E**：黄褐色 - MHC
+- **HLA-DR**：黄褐色 - MHC II
+- **CD44**：粉紫色 - 干细胞标记
+- **CD138**：绿色 - 浆细胞
+- **MMP9**：黄橙色 - 基质金属蛋白酶
+- **HIF1A**：蓝色 - 缺氧标记
+- **Bcl-2**：黄绿色 - 抗凋亡
+- **TCF-1**：青绿色 - T细胞标记
+- **ICOS**：黄绿色 - 共刺激分子
+- **CD45RO**：橙黄色 - 记忆T细胞
+- **CD14**：青色 - 单核细胞
+- **CD21**：紫色 - B细胞标记
+- **CD40**：浅红色 - 共刺激分子
+
+**章节来源**
+- [predict_he_to_codex_h5.py:75-117](file://hex/predict_he_to_codex_h5.py#L75-L117)
+- [app.py:446-488](file://webapp/app.py#L446-L488)

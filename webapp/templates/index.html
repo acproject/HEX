@@ -511,6 +511,44 @@
                             随机分布：快速生成，仅展示荧光效果
                         </p>
                     </div>
+
+                    <div style="margin-top: 15px;">
+                        <label style="color: #aaa;">输出稳定化:</label>
+                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 5px;">
+                            <div>
+                                <label style="color: #888; font-size: 12px;">通道标准化</label>
+                                <select id="channelNormSelect" style="width: 100%; margin-top: 5px; padding: 8px; background: #2a2a2a; color: white; border: 1px solid #444; border-radius: 5px;">
+                                    <option value="none">不处理</option>
+                                    <option value="zscore">z-score (每通道)</option>
+                                </select>
+                            </div>
+                            <div>
+                                <label style="color: #888; font-size: 12px;">细胞mask</label>
+                                <select id="segmentationSelect" style="width: 100%; margin-top: 5px; padding: 8px; background: #2a2a2a; color: white; border: 1px solid #444; border-radius: 5px;">
+                                    <option value="none">不使用</option>
+                                    <option value="weak">弱分割 (H&E)</option>
+                                </select>
+                            </div>
+                        </div>
+                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px;">
+                            <div>
+                                <label style="color: #888; font-size: 12px;">PSF σ</label>
+                                <input type="number" id="psfSigmaInput" value="0" step="0.1" min="0" style="width: 100%; margin-top: 5px; padding: 8px; background: #2a2a2a; color: white; border: 1px solid #444; border-radius: 5px;">
+                            </div>
+                            <div>
+                                <label style="color: #888; font-size: 12px;">Poisson scale</label>
+                                <input type="number" id="poissonScaleInput" value="0" step="1" min="0" style="width: 100%; margin-top: 5px; padding: 8px; background: #2a2a2a; color: white; border: 1px solid #444; border-radius: 5px;">
+                            </div>
+                            <div>
+                                <label style="color: #888; font-size: 12px;">背景噪声 σ</label>
+                                <input type="number" id="backgroundNoiseSigmaInput" value="0" step="0.01" min="0" style="width: 100%; margin-top: 5px; padding: 8px; background: #2a2a2a; color: white; border: 1px solid #444; border-radius: 5px;">
+                            </div>
+                            <div>
+                                <label style="color: #888; font-size: 12px;">Noise seed</label>
+                                <input type="number" id="noiseSeedInput" value="" step="1" style="width: 100%; margin-top: 5px; padding: 8px; background: #2a2a2a; color: white; border: 1px solid #444; border-radius: 5px;">
+                            </div>
+                        </div>
+                    </div>
                     
                     <div style="margin-top: 15px;">
                         <label style="color: #aaa;">叠加透明度: <span id="alphaValue">0.6</span></label>
@@ -538,12 +576,11 @@
                         <button class="tab" onclick="switchFluorescentTab('fluorescent', event)">仅荧光层</button>
                         <button class="tab" onclick="switchFluorescentTab('original', event)">原始H&E</button>
                     </div>
-                    <div class="image-preview" id="fluorescentPreview">
-                        <div id="overlayStack" style="position: relative; width: 100%; display: none;">
-                            <img id="overlayBaseImage" src="" alt="H&E Base" style="width: 100%; display: block; border-radius: 10px;">
-                            <img id="overlayFluorescentLayer" src="" alt="Fluorescent Layer" style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; border-radius: 10px; pointer-events: none; opacity: 0.6;">
-                        </div>
-                        <img id="fluorescentImage" src="" alt="Fluorescent" style="max-width: 100%; border-radius: 10px; display: block;">
+                    <div class="image-preview" id="fluorescentPreview" style="background: #000; border-radius: 10px; min-height: 300px;">
+                        <!-- Canvas 容器 -->
+                        <canvas id="fluorescentCanvas" style="max-width: 100%; border-radius: 10px; display: none;"></canvas>
+                        <!-- 叠加Canvas -->
+                        <canvas id="overlayCanvas" style="max-width: 100%; border-radius: 10px;"></canvas>
                     </div>
                     <div id="markerLayers" style="display: none; margin-top: 10px;">
                         <div style="display:flex; justify-content: space-between; align-items:center; margin: 0 0 10px 0;">
@@ -905,6 +942,58 @@
         let fluorescentDebounceTimer = null;
         let fluorescentInFlight = false;
         
+        // Canvas 相关变量
+        let heCanvasImage = null;  // H&E 原图 Image 对象
+        let fluorescentImageData = null;  // 荧光层 ImageData
+        let canvasWidth = 0;
+        let canvasHeight = 0;
+        
+        // 标志物颜色映射 (RGB格式)
+        const MARKER_COLORS = {
+            'DAPI': {r: 30, g: 60, b: 255},      // 蓝色 - 核
+            'CD8': {r: 180, g: 80, b: 220},      // 紫色 - T细胞
+            'Pan-Cytokeratin': {r: 0, g: 220, b: 220},  // 青色 - 肿瘤
+            'CD3e': {r: 150, g: 100, b: 200},    // 浅紫
+            'CD163': {r: 255, g: 180, b: 80},    // 橙色 - 巨噬细胞
+            'CD20': {r: 80, g: 150, b: 255},     // 蓝色 - B细胞
+            'CD4': {r: 200, g: 120, b: 180},     // 粉紫
+            'FAP': {r: 255, g: 80, b: 80},       // 红色 - 成纤维
+            'CD68': {r: 80, g: 255, b: 120},     // 绿色 - 巨噬细胞
+            'Ki67': {r: 255, g: 60, b: 150},     // 品红 - 增殖
+            'CD31': {r: 60, g: 255, b: 100},     // 绿色 - 血管
+            'PD-L1': {r: 255, g: 255, b: 80},    // 黄色 - 免疫检查点
+            'aSMA': {r: 220, g: 100, b: 220},    // 紫红 - 平滑肌
+            'EpCAM': {r: 0, g: 200, b: 200},     // 青色 - 上皮
+            'CD45': {r: 100, g: 180, b: 255},    // 浅蓝 - 白细胞
+            'CD14': {r: 100, g: 180, b: 180},    // 青色
+            'CD11c': {r: 180, g: 200, b: 100},   // 黄绿
+            'Granzyme B': {r: 255, g: 100, b: 100}, // 红
+            'FOXP3': {r: 200, g: 80, b: 180},    // 紫粉
+            'LAG3': {r: 180, g: 120, b: 200},    // 紫
+            'VISTA': {r: 200, g: 180, b: 80},    // 橙
+            'CD44': {r: 100, g: 200, b: 180},    // 青绿
+            'CD45RO': {r: 120, g: 160, b: 220},  // 浅蓝
+            'TCF-1': {r: 160, g: 120, b: 200},   // 浅紫
+            'ICOS': {r: 200, g: 160, b: 100},    // 橙
+            'Bcl-2': {r: 180, g: 100, b: 160},   // 粉紫
+            'HLA-E': {r: 140, g: 180, b: 140},   // 绿灰
+            'MPO': {r: 255, g: 140, b: 80},      // 橙红
+            'Collagen IV': {r: 180, g: 140, b: 100}, // 棕
+            'CD138': {r: 200, g: 200, b: 100},   // 黄
+            'CD21': {r: 180, g: 100, b: 180},    // 紫
+            'E-cadherin': {r: 80, g: 200, b: 200}, // 青
+            'CD40': {r: 200, g: 150, b: 150},    // 浅红
+            'MMP9': {r: 220, g: 160, b: 80},     // 橙
+            'PD-1': {r: 255, g: 200, b: 100},    // 金黄
+            'CD66b': {r: 180, g: 140, b: 80},    // 棕橙
+            'Mac2/Galectin-3': {r: 160, g: 180, b: 100}, // 黄绿
+        };
+        
+        // 获取标志物颜色
+        function getMarkerColor(marker) {
+            return MARKER_COLORS[marker] || {r: 255, g: 255, b: 255};
+        }
+        
         // 初始化荧光层控制
         function initFluorescentControls(predictions) {
             currentPredictions = predictions;
@@ -934,8 +1023,10 @@
             if (!alphaSlider.dataset.bound) {
                 alphaSlider.addEventListener('input', function() {
                     document.getElementById('alphaValue').textContent = this.value;
-                        const layer = document.getElementById('overlayFluorescentLayer');
-                        if (layer) layer.style.opacity = String(this.value);
+                    // Canvas渲染时重新绘制叠加层
+                    if (currentTab === 'overlay') {
+                        renderOverlayCanvas();
+                    }
                 });
                 alphaSlider.dataset.bound = '1';
             }
@@ -957,6 +1048,54 @@
                     scheduleGenerateFluorescent();
                 });
                 modeSelect.dataset.bound = '1';
+            }
+
+            const channelNormSelect = document.getElementById('channelNormSelect');
+            if (channelNormSelect && !channelNormSelect.dataset.bound) {
+                channelNormSelect.addEventListener('change', function() {
+                    scheduleGenerateFluorescent();
+                });
+                channelNormSelect.dataset.bound = '1';
+            }
+
+            const segmentationSelect = document.getElementById('segmentationSelect');
+            if (segmentationSelect && !segmentationSelect.dataset.bound) {
+                segmentationSelect.addEventListener('change', function() {
+                    scheduleGenerateFluorescent();
+                });
+                segmentationSelect.dataset.bound = '1';
+            }
+
+            const psfSigmaInput = document.getElementById('psfSigmaInput');
+            if (psfSigmaInput && !psfSigmaInput.dataset.bound) {
+                psfSigmaInput.addEventListener('change', function() {
+                    scheduleGenerateFluorescent();
+                });
+                psfSigmaInput.dataset.bound = '1';
+            }
+
+            const poissonScaleInput = document.getElementById('poissonScaleInput');
+            if (poissonScaleInput && !poissonScaleInput.dataset.bound) {
+                poissonScaleInput.addEventListener('change', function() {
+                    scheduleGenerateFluorescent();
+                });
+                poissonScaleInput.dataset.bound = '1';
+            }
+
+            const backgroundNoiseSigmaInput = document.getElementById('backgroundNoiseSigmaInput');
+            if (backgroundNoiseSigmaInput && !backgroundNoiseSigmaInput.dataset.bound) {
+                backgroundNoiseSigmaInput.addEventListener('change', function() {
+                    scheduleGenerateFluorescent();
+                });
+                backgroundNoiseSigmaInput.dataset.bound = '1';
+            }
+
+            const noiseSeedInput = document.getElementById('noiseSeedInput');
+            if (noiseSeedInput && !noiseSeedInput.dataset.bound) {
+                noiseSeedInput.addEventListener('change', function() {
+                    scheduleGenerateFluorescent();
+                });
+                noiseSeedInput.dataset.bound = '1';
             }
 
             if (!checkboxContainer.dataset.bound) {
@@ -1001,6 +1140,214 @@
                 const cb = document.querySelector(`.marker-checkbox[value="${name}"]`);
                 if (cb) cb.checked = true;
             });
+        }
+        
+        // ========== Canvas 荧光渲染 ==========
+        
+        // 从base64加载图像
+        function loadImageFromBase64(base64) {
+            return new Promise((resolve, reject) => {
+                const img = new Image();
+                img.onload = () => resolve(img);
+                img.onerror = reject;
+                img.src = `data:image/png;base64,${base64}`;
+            });
+        }
+        
+        // Canvas发光效果
+        function applyGlowEffect(canvas, ctx, intensity = 0.3, passes = 3) {
+            ctx.globalAlpha = intensity;
+            ctx.globalCompositeOperation = 'lighter';
+            for (let i = 0; i < passes; i++) {
+                ctx.drawImage(canvas, 0, 0);
+            }
+            ctx.globalAlpha = 1.0;
+            ctx.globalCompositeOperation = 'source-over';
+        }
+        
+        // 渲染叠加Canvas
+        async function renderOverlayCanvas() {
+            const overlayCanvas = document.getElementById('overlayCanvas');
+            const ctx = overlayCanvas.getContext('2d');
+            
+            if (!heCanvasImage || !fluorescentImageData) {
+                return;
+            }
+            
+            // 设置Canvas尺寸
+            overlayCanvas.width = canvasWidth;
+            overlayCanvas.height = canvasHeight;
+            
+            const alpha = parseFloat(document.getElementById('alphaSlider').value);
+            
+            // 绘制H&E背景（压暗处理）
+            ctx.drawImage(heCanvasImage, 0, 0, canvasWidth, canvasHeight);
+            const heData = ctx.getImageData(0, 0, canvasWidth, canvasHeight);
+            
+            // 转换为灰度并压暗
+            for (let i = 0; i < heData.data.length; i += 4) {
+                const gray = heData.data[i] * 0.3 + heData.data[i+1] * 0.59 + heData.data[i+2] * 0.11;
+                // 压暗背景，让荧光更突出
+                const darkened = gray * 0.35;
+                heData.data[i] = darkened * 0.95;     // R
+                heData.data[i+1] = darkened * 0.9;     // G
+                heData.data[i+2] = darkened * 0.98;    // B
+                heData.data[i+3] = 255;                // Alpha
+            }
+            ctx.putImageData(heData, 0, 0);
+            
+            // 创建荧光层临时Canvas
+            const tempCanvas = document.createElement('canvas');
+            tempCanvas.width = canvasWidth;
+            tempCanvas.height = canvasHeight;
+            const tempCtx = tempCanvas.getContext('2d');
+            
+            // 绘制荧光层
+            tempCtx.putImageData(fluorescentImageData, 0, 0);
+            
+            // 使用screen混合模式叠加荧光
+            ctx.globalCompositeOperation = 'screen';
+            ctx.globalAlpha = alpha * 0.9;  // 降低整体透明度
+            ctx.drawImage(tempCanvas, 0, 0);
+            
+            // 使用lighter混合模式增强亮点
+            ctx.globalCompositeOperation = 'lighter';
+            ctx.globalAlpha = alpha * 0.3;  // 轻微的加法混合
+            ctx.drawImage(tempCanvas, 0, 0);
+            
+            ctx.globalAlpha = 1.0;
+            ctx.globalCompositeOperation = 'source-over';
+            
+            // 应用发光效果（减弱）
+            applyGlowEffect(overlayCanvas, ctx, 0.08, 1);
+        }
+        
+        // 渲染仅荧光Canvas
+        async function renderFluorescentCanvas() {
+            const fluoCanvas = document.getElementById('fluorescentCanvas');
+            const ctx = fluoCanvas.getContext('2d');
+            
+            if (!fluorescentImageData) return;
+            
+            fluoCanvas.width = canvasWidth;
+            fluoCanvas.height = canvasHeight;
+            
+            // 黑色背景
+            ctx.fillStyle = '#000000';
+            ctx.fillRect(0, 0, canvasWidth, canvasHeight);
+            
+            // 绘制荧光
+            ctx.putImageData(fluorescentImageData, 0, 0);
+            
+            // 发光效果
+            applyGlowEffect(fluoCanvas, ctx, 0.25, 3);
+        }
+        
+        // 从后端返回的图像生成Canvas荧光
+        async function setupCanvasFromImages() {
+            if (!originalResizedImage || !perMarkerImages) return;
+            
+            // 加载H&E图像
+            heCanvasImage = await loadImageFromBase64(originalResizedImage);
+            canvasWidth = heCanvasImage.width;
+            canvasHeight = heCanvasImage.height;
+            
+            // 创建荧光ImageData
+            const selected = overlaySelectedMarkers || Object.keys(perMarkerImages);
+            
+            // 先创建一个临时Canvas来合并荧光通道
+            const tempCanvas = document.createElement('canvas');
+            tempCanvas.width = canvasWidth;
+            tempCanvas.height = canvasHeight;
+            const tempCtx = tempCanvas.getContext('2d');
+            
+            // 黑色背景
+            tempCtx.fillStyle = '#000000';
+            tempCtx.fillRect(0, 0, canvasWidth, canvasHeight);
+            
+            // 使用加法混合叠加各通道
+            tempCtx.globalCompositeOperation = 'lighter';
+            
+            for (const marker of selected) {
+                if (!perMarkerImages[marker]) continue;
+                
+                const img = await loadImageFromBase64(perMarkerImages[marker]);
+                tempCtx.globalAlpha = 0.8;
+                tempCtx.drawImage(img, 0, 0, canvasWidth, canvasHeight);
+            }
+            
+            tempCtx.globalAlpha = 1.0;
+            tempCtx.globalCompositeOperation = 'source-over';
+            
+            // 获取ImageData
+            fluorescentImageData = tempCtx.getImageData(0, 0, canvasWidth, canvasHeight);
+            
+            // 增强对比度
+            const data = fluorescentImageData.data;
+            for (let i = 0; i < data.length; i += 4) {
+                // Gamma增强
+                data[i] = Math.pow(data[i] / 255, 0.7) * 255;
+                data[i+1] = Math.pow(data[i+1] / 255, 0.7) * 255;
+                data[i+2] = Math.pow(data[i+2] / 255, 0.7) * 255;
+            }
+            
+            // 渲染
+            await renderOverlayCanvas();
+            await renderFluorescentCanvas();
+        }
+        
+        // 更新叠加显示（当选择的通道变化时）
+        async function updateOverlayFromSelection() {
+            if (!perMarkerImages) return;
+            
+            const selected = overlaySelectedMarkers || [];
+            if (selected.length === 0) {
+                // 清空荧光层
+                const tempCanvas = document.createElement('canvas');
+                tempCanvas.width = canvasWidth;
+                tempCanvas.height = canvasHeight;
+                const tempCtx = tempCanvas.getContext('2d');
+                tempCtx.fillStyle = '#000000';
+                tempCanvas.fillRect(0, 0, canvasWidth, canvasHeight);
+                fluorescentImageData = tempCtx.getImageData(0, 0, canvasWidth, canvasHeight);
+            } else {
+                // 重新生成荧光层
+                const tempCanvas = document.createElement('canvas');
+                tempCanvas.width = canvasWidth;
+                tempCanvas.height = canvasHeight;
+                const tempCtx = tempCanvas.getContext('2d');
+                
+                tempCtx.fillStyle = '#000000';
+                tempCtx.fillRect(0, 0, canvasWidth, canvasHeight);
+                tempCtx.globalCompositeOperation = 'lighter';
+                
+                for (const marker of selected) {
+                    if (!perMarkerImages[marker]) continue;
+                    const img = await loadImageFromBase64(perMarkerImages[marker]);
+                    tempCtx.globalAlpha = 0.8;
+                    tempCtx.drawImage(img, 0, 0, canvasWidth, canvasHeight);
+                }
+                
+                tempCtx.globalAlpha = 1.0;
+                tempCtx.globalCompositeOperation = 'source-over';
+                
+                fluorescentImageData = tempCtx.getImageData(0, 0, canvasWidth, canvasHeight);
+                
+                // 增强对比度
+                const data = fluorescentImageData.data;
+                for (let i = 0; i < data.length; i += 4) {
+                    data[i] = Math.pow(data[i] / 255, 0.7) * 255;
+                    data[i+1] = Math.pow(data[i+1] / 255, 0.7) * 255;
+                    data[i+2] = Math.pow(data[i+2] / 255, 0.7) * 255;
+                }
+            }
+            
+            // 根据当前tab渲染
+            if (currentTab === 'overlay') {
+                await renderOverlayCanvas();
+            } else if (currentTab === 'fluorescent') {
+                await renderFluorescentCanvas();
+            }
         }
 
         function renderMarkerLayers() {
@@ -1062,7 +1409,7 @@
         function scheduleOverlayComposite() {
             if (overlayCompositeDebounceTimer) clearTimeout(overlayCompositeDebounceTimer);
             overlayCompositeDebounceTimer = setTimeout(() => {
-                updateOverlayComposite();
+                updateOverlayFromSelection();
             }, 60);
         }
 
@@ -1076,46 +1423,9 @@
             return img;
         }
 
+        // 保留原函数但简化
         async function updateOverlayComposite() {
-            if (currentTab !== 'overlay') return;
-            const overlayStack = document.getElementById('overlayStack');
-            const overlayLayer = document.getElementById('overlayFluorescentLayer');
-            if (!overlayStack || !overlayLayer) return;
-            if (!perMarkerImages || Object.keys(perMarkerImages).length === 0) {
-                if (fluorescentOnlyImage) overlayLayer.src = `data:image/png;base64,${fluorescentOnlyImage}`;
-                overlayLayer.style.display = 'block';
-                return;
-            }
-
-            const selected = overlaySelectedMarkers || [];
-            if (selected.length === 0) {
-                overlayLayer.src = '';
-                overlayLayer.style.display = 'none';
-                return;
-            }
-            overlayLayer.style.display = 'block';
-
-            const firstB64 = perMarkerImages[selected[0]];
-            if (!firstB64) return;
-            const firstImg = await _loadB64Image(firstB64);
-            const w = firstImg.naturalWidth || firstImg.width;
-            const h = firstImg.naturalHeight || firstImg.height;
-            if (!w || !h) return;
-
-            const canvas = document.createElement('canvas');
-            canvas.width = w;
-            canvas.height = h;
-            const ctx = canvas.getContext('2d');
-            if (!ctx) return;
-            ctx.clearRect(0, 0, w, h);
-            ctx.globalCompositeOperation = 'lighter';
-            for (const name of selected) {
-                const b64 = perMarkerImages[name];
-                if (!b64) continue;
-                const im = await _loadB64Image(b64);
-                ctx.drawImage(im, 0, 0, w, h);
-            }
-            overlayLayer.src = canvas.toDataURL('image/png');
+            await updateOverlayFromSelection();
         }
 
         function updateMarkerValueDisplay(values) {
@@ -1131,11 +1441,36 @@
             });
         }
 
-        function showMarkerChannel(name) {
+        async function showMarkerChannel(name) {
             if (!perMarkerImages || !perMarkerImages[name]) return;
-            switchFluorescentTab('fluorescent');
-            const img = document.getElementById('fluorescentImage');
-            img.src = `data:image/png;base64,${perMarkerImages[name]}`;
+            
+            // 切换到荧光视图
+            const fluorescentCanvas = document.getElementById('fluorescentCanvas');
+            const overlayCanvas = document.getElementById('overlayCanvas');
+            
+            if (overlayCanvas) overlayCanvas.style.display = 'none';
+            if (fluorescentCanvas) fluorescentCanvas.style.display = 'block';
+            
+            // 在Canvas上绘制单个通道
+            const img = await loadImageFromBase64(perMarkerImages[name]);
+            fluorescentCanvas.width = img.width;
+            fluorescentCanvas.height = img.height;
+            
+            const ctx = fluorescentCanvas.getContext('2d');
+            ctx.fillStyle = '#000000';
+            ctx.fillRect(0, 0, img.width, img.height);
+            ctx.drawImage(img, 0, 0);
+            
+            // 应用发光效果
+            applyGlowEffect(fluorescentCanvas, ctx, 0.25, 3);
+            
+            currentTab = 'fluorescent';
+            
+            // 更新标签页样式
+            document.querySelectorAll('#fluorescentSection .tab').forEach(t => t.classList.remove('active'));
+            const tabs = document.querySelectorAll('#fluorescentSection .tab');
+            if (tabs[1]) tabs[1].classList.add('active');
+            
             const wrap = document.getElementById('markerLayers');
             const title = wrap ? wrap.querySelector('h4') : null;
             if (title) title.textContent = `通道图层（当前：${name}，点击缩略图切换）`;
@@ -1160,6 +1495,13 @@
             const alpha = parseFloat(document.getElementById('alphaSlider').value);
             const sparsityPercentile = parseFloat(document.getElementById('sparsitySlider').value);
             const mode = document.getElementById('modeSelect').value;
+            const channelNorm = document.getElementById('channelNormSelect') ? document.getElementById('channelNormSelect').value : 'none';
+            const segmentationMode = document.getElementById('segmentationSelect') ? document.getElementById('segmentationSelect').value : 'none';
+            const psfSigma = parseFloat((document.getElementById('psfSigmaInput') || {}).value || '0') || 0;
+            const poissonScale = parseFloat((document.getElementById('poissonScaleInput') || {}).value || '0') || 0;
+            const backgroundNoiseSigma = parseFloat((document.getElementById('backgroundNoiseSigmaInput') || {}).value || '0') || 0;
+            const noiseSeedRaw = ((document.getElementById('noiseSeedInput') || {}).value || '').trim();
+            const noiseSeed = noiseSeedRaw === '' ? null : parseInt(noiseSeedRaw, 10);
             
             // 显示加载提示
             const btn = document.getElementById('generateFluorescentBtn');
@@ -1179,7 +1521,13 @@
                         selected_markers: selectedMarkers,
                         alpha: alpha,
                         sparsity_percentile: sparsityPercentile,
-                        mode: mode
+                        mode: mode,
+                        channel_norm: channelNorm,
+                        segmentation_mode: segmentationMode,
+                        psf_sigma: psfSigma,
+                        poisson_scale: poissonScale,
+                        background_noise_sigma: backgroundNoiseSigma,
+                        noise_seed: noiseSeed
                     })
                 });
                 
@@ -1199,8 +1547,11 @@
                 updateMarkerValueDisplay(perMarkerValues);
                 renderMarkerLayers();
                 
+                // 设置Canvas渲染
+                await setupCanvasFromImages();
+                
                 // 显示叠加图像
-                switchFluorescentTab('overlay');
+                await switchFluorescentTab('overlay');
                 
             } catch (error) {
                 alert('生成荧光层失败: ' + error.message);
@@ -1215,7 +1566,7 @@
         }
         
         // 切换荧光层视图
-        function switchFluorescentTab(tab, evt) {
+        async function switchFluorescentTab(tab, evt) {
             currentTab = tab;
             
             // 更新标签页样式
@@ -1232,32 +1583,30 @@
                 }
             }
             
-            const img = document.getElementById('fluorescentImage');
-            const overlayStack = document.getElementById('overlayStack');
-            const overlayBase = document.getElementById('overlayBaseImage');
-            const overlayLayer = document.getElementById('overlayFluorescentLayer');
+            const overlayCanvas = document.getElementById('overlayCanvas');
+            const fluorescentCanvas = document.getElementById('fluorescentCanvas');
             
             switch(tab) {
                 case 'overlay':
-                    if (overlayStack) overlayStack.style.display = 'block';
-                    if (img) img.style.display = 'none';
-                    if (overlayBase) {
-                        if (originalResizedImage) overlayBase.src = `data:image/png;base64,${originalResizedImage}`;
-                        else if (originalImage) overlayBase.src = `data:image/png;base64,${originalImage}`;
-                    }
-                    scheduleOverlayComposite();
-                    if (overlayLayer) overlayLayer.style.opacity = String(document.getElementById('alphaSlider').value);
+                    if (overlayCanvas) overlayCanvas.style.display = 'block';
+                    if (fluorescentCanvas) fluorescentCanvas.style.display = 'none';
+                    await renderOverlayCanvas();
                     break;
                 case 'fluorescent':
-                    if (overlayStack) overlayStack.style.display = 'none';
-                    if (img) img.style.display = 'block';
-                    if (fluorescentOnlyImage) img.src = `data:image/png;base64,${fluorescentOnlyImage}`;
+                    if (overlayCanvas) overlayCanvas.style.display = 'none';
+                    if (fluorescentCanvas) fluorescentCanvas.style.display = 'block';
+                    await renderFluorescentCanvas();
                     break;
                 case 'original':
-                    if (overlayStack) overlayStack.style.display = 'none';
-                    if (img) img.style.display = 'block';
-                    if (originalResizedImage) img.src = `data:image/png;base64,${originalResizedImage}`;
-                    else if (originalImage) img.src = `data:image/png;base64,${originalImage}`;
+                    if (overlayCanvas) overlayCanvas.style.display = 'none';
+                    if (fluorescentCanvas) fluorescentCanvas.style.display = 'block';
+                    // 在fluorescentCanvas上绘制原始H&E
+                    if (fluorescentCanvas && heCanvasImage) {
+                        const ctx = fluorescentCanvas.getContext('2d');
+                        fluorescentCanvas.width = canvasWidth;
+                        fluorescentCanvas.height = canvasHeight;
+                        ctx.drawImage(heCanvasImage, 0, 0);
+                    }
                     break;
             }
         }
