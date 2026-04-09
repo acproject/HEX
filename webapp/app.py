@@ -157,7 +157,13 @@ def _rgb_black_to_transparent_rgba(
         m = np.asarray(alpha_mask)
         if m.shape != alpha.shape:
             m_img = Image.fromarray((m.astype(np.uint8) * 255), mode="L")
-            m_img = m_img.resize((alpha.shape[1], alpha.shape[0]), Image.NEAREST)
+            target_w = int(alpha.shape[1])
+            target_h = int(alpha.shape[0])
+            if m.shape[0] >= target_h and m.shape[1] >= target_w:
+                resample = Image.BOX
+            else:
+                resample = Image.NEAREST
+            m_img = m_img.resize((target_w, target_h), resample=resample)
             m = (np.asarray(m_img, dtype=np.uint8) > 0)
         else:
             m = m.astype(bool, copy=False)
@@ -309,6 +315,47 @@ def _compute_cell_mask_weak(
         cells = cells & tissue_mask.astype(bool, copy=False)
 
     return cells.astype(bool, copy=False)
+
+
+def _compute_cell_weight_map_weak(
+    img,
+    tissue_mask=None,
+    dilate_radius: int = 20,
+    min_size: int = 64,
+    sigma: float = 12.0,
+    floor: float = 0.35,
+):
+    import scipy.ndimage as ndimage
+
+    nuclei_or_cells = _compute_cell_mask_weak(
+        img,
+        tissue_mask=tissue_mask,
+        dilate_radius=dilate_radius,
+        min_size=min_size,
+    )
+    if nuclei_or_cells is None:
+        return None
+
+    sigma = float(max(0.0, sigma))
+    floor = float(np.clip(floor, 0.0, 1.0))
+
+    x = nuclei_or_cells.astype(np.float32, copy=False)
+    if sigma > 0:
+        x = ndimage.gaussian_filter(x, sigma=sigma)
+
+    if tissue_mask is not None:
+        x = x * tissue_mask.astype(np.float32, copy=False)
+
+    mx = float(np.max(x))
+    if mx > 1e-8:
+        x = x / mx
+    else:
+        x = np.zeros_like(x, dtype=np.float32)
+
+    w = floor + (1.0 - floor) * x
+    if tissue_mask is not None:
+        w = w * tissue_mask.astype(np.float32, copy=False)
+    return w.astype(np.float32, copy=False)
 
 
 def extract_features(img_tensor):
@@ -1240,7 +1287,7 @@ def generate_fluorescent():
         channel_ref_stats = data.get('channel_ref_stats', None)
         z_clip = float(data.get('z_clip', 3.0))
         segmentation_mode = str(data.get('segmentation_mode', 'none')).strip().lower()
-        seg_dilate = int(data.get('seg_dilate', 6))
+        seg_dilate = int(data.get('seg_dilate', 20))
         seg_min_size = int(data.get('seg_min_size', 64))
 
         if mode == "hex" and (output_dir is None or str(output_dir).strip() == ""):
@@ -1288,33 +1335,36 @@ def generate_fluorescent():
             
             # 生成荧光叠加
             tissue_mask = _compute_tissue_mask(img_infer, white_thresh=0.92)
-            cell_mask = None
+            cell_weight = None
             if segmentation_mode == "weak":
-                cell_mask = _compute_cell_mask_weak(
+                cell_weight = _compute_cell_weight_map_weak(
                     img_infer,
                     tissue_mask=tissue_mask,
                     dilate_radius=seg_dilate,
                     min_size=seg_min_size,
                 )
-            combined_mask = cell_mask if cell_mask is not None else tissue_mask
             if channel_norm == "zscore":
                 spatial_maps = _normalize_spatial_maps_zscore(
                     spatial_maps,
-                    tissue_mask=combined_mask,
+                    tissue_mask=tissue_mask,
                     ref_stats=channel_ref_stats,
                     z_clip=z_clip,
                 )
-            if combined_mask is not None and np.any(combined_mask):
-                predictions = {m: float(np.mean(spatial_maps[m][combined_mask])) for m in spatial_maps}
+            if cell_weight is not None:
+                for m in spatial_maps:
+                    spatial_maps[m] = np.clip(spatial_maps[m] * cell_weight, 0.0, 1.0).astype(np.float32, copy=False)
+
+            if tissue_mask is not None and np.any(tissue_mask):
+                predictions = {m: float(np.mean(spatial_maps[m][tissue_mask])) for m in spatial_maps}
             result, fluorescent_only = generate_spatial_fluorescent(
                 img_infer,
                 spatial_maps, 
                 selected_markers, 
                 alpha,
-                tissue_mask=combined_mask,
+                tissue_mask=tissue_mask,
                 threshold_percentile=threshold_percentile,
             )
-            per_marker_images_pil = {m: render_single_marker_fluorescent(spatial_maps[m], m, tissue_mask=combined_mask, threshold_percentile=threshold_percentile) for m in selected_markers if m in spatial_maps}
+            per_marker_images_pil = {m: render_single_marker_fluorescent(spatial_maps[m], m, tissue_mask=tissue_mask, threshold_percentile=threshold_percentile) for m in selected_markers if m in spatial_maps}
 
             if result.size != display_size:
                 result = result.resize(display_size, Image.LANCZOS)
@@ -1354,10 +1404,10 @@ def generate_fluorescent():
                 fluorescent_only,
                 alpha_floor=transparent_alpha_floor,
                 alpha_gamma=1.0,
-                alpha_mask=combined_mask,
+                alpha_mask=tissue_mask,
             )
             per_marker_images_pil = {
-                m: _rgb_black_to_transparent_rgba(im, alpha_floor=transparent_alpha_floor, alpha_gamma=1.0, alpha_mask=combined_mask)
+                m: _rgb_black_to_transparent_rgba(im, alpha_floor=transparent_alpha_floor, alpha_gamma=1.0, alpha_mask=tissue_mask)
                 for m, im in per_marker_images_pil.items()
             }
 
