@@ -4,7 +4,31 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>HEX/MUSK 虚拟空间蛋白质组学可视化</title>
+    <link rel="icon" href="data:,">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script>
+        async function ensureChartJs() {
+            if (window.Chart) return true;
+            const fallbacks = [
+                'https://unpkg.com/chart.js',
+                'https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js'
+            ];
+            for (const src of fallbacks) {
+                try {
+                    await new Promise((resolve, reject) => {
+                        const script = document.createElement('script');
+                        script.src = src;
+                        script.onload = resolve;
+                        script.onerror = reject;
+                        document.head.appendChild(script);
+                    });
+                    if (window.Chart) return true;
+                } catch (error) {
+                }
+            }
+            return false;
+        }
+    </script>
     <style>
         * {
             margin: 0;
@@ -617,7 +641,58 @@
         let overlaySelectedMarkers = null;
         let overlayCompositeDebounceTimer = null;
         const _overlayImgCache = {};
-        
+
+        async function parseJsonResponse(response) {
+            const contentType = response.headers.get('content-type') || '';
+            let data = null;
+            if (contentType.includes('application/json')) {
+                data = await response.json();
+            } else {
+                const text = await response.text();
+                data = {
+                    success: response.ok,
+                    error: text || `HTTP ${response.status}`
+                };
+            }
+            if (!response.ok && (!data || !data.error)) {
+                throw new Error(`HTTP ${response.status}`);
+            }
+            return data;
+        }
+
+        async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 300000) {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+            try {
+                const response = await fetch(url, {...options, signal: controller.signal});
+                return await parseJsonResponse(response);
+            } catch (error) {
+                if (error.name === 'AbortError') {
+                    throw new Error('请求超时，请稍后重试或切换到更快的预测模式');
+                }
+                throw error;
+            } finally {
+                clearTimeout(timeoutId);
+            }
+        }
+
+        function renderChartFallbackMessage(canvasId, message) {
+            const canvas = document.getElementById(canvasId);
+            if (!canvas) return;
+            const width = Math.max(canvas.clientWidth || 400, 240);
+            const height = Math.max(canvas.clientHeight || 240, 180);
+            canvas.width = width;
+            canvas.height = height;
+            const ctx = canvas.getContext('2d');
+            ctx.clearRect(0, 0, width, height);
+            ctx.fillStyle = 'rgba(255,255,255,0.03)';
+            ctx.fillRect(0, 0, width, height);
+            ctx.fillStyle = '#9aa4b2';
+            ctx.font = '14px Segoe UI';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(message, width / 2, height / 2);
+        }
         // 颜色映射
         const categoryColors = {
             '免疫细胞标记': '#00d4ff',
@@ -662,13 +737,12 @@
                 await new Promise(r => setTimeout(r, 500));
                 
                 updateStep(2);
-                const response = await fetch('/analyze', {
+                const data = await fetchJsonWithTimeout('/analyze', {
                     method: 'POST',
                     body: formData
                 });
                 
                 updateStep(3);
-                const data = await response.json();
                 
                 if (!data.success) {
                     throw new Error(data.error);
@@ -678,7 +752,7 @@
                 currentImagePath = data.saved_path || null;
                 
                 updateStep(4);
-                displayResults(data);
+                await displayResults(data);
                 
             } catch (error) {
                 alert('分析失败: ' + error.message);
@@ -699,21 +773,20 @@
                 await new Promise(r => setTimeout(r, 500));
                 
                 updateStep(2);
-                const response = await fetch('/analyze', {
+                const data = await fetchJsonWithTimeout('/analyze', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({image_path: imagePath})
                 });
                 
                 updateStep(3);
-                const data = await response.json();
                 
                 if (!data.success) {
                     throw new Error(data.error);
                 }
                 
                 updateStep(4);
-                displayResults(data);
+                await displayResults(data);
                 
             } catch (error) {
                 alert('分析失败: ' + error.message);
@@ -728,8 +801,7 @@
             document.getElementById('loadingSection').style.display = 'block';
             
             try {
-                const response = await fetch('/batch_analyze', {method: 'POST'});
-                const data = await response.json();
+                const data = await fetchJsonWithTimeout('/batch_analyze', {method: 'POST'});
                 
                 if (!data.success) {
                     throw new Error(data.error);
@@ -744,7 +816,7 @@
         }
         
         // 显示结果
-        function displayResults(data) {
+        async function displayResults(data) {
             document.getElementById('loadingSection').style.display = 'none';
             document.getElementById('resultsSection').style.display = 'block';
             
@@ -760,7 +832,7 @@
             originalImage = data.image;  // 保存原始图像
             
             // 更新图表
-            updateCharts(data.predictions);
+            await updateCharts(data.predictions);
             
             // 更新分类结果
             updateCategorizedResults(data.categorized_predictions);
@@ -770,10 +842,25 @@
         }
         
         // 更新图表
-        function updateCharts(predictions) {
+        async function updateCharts(predictions) {
+            const chartReady = await ensureChartJs();
             const labels = Object.keys(predictions);
             const values = Object.values(predictions);
             const colors = values.map(v => getValueColor(v));
+
+            if (!chartReady || !window.Chart) {
+                if (radarChart) {
+                    radarChart.destroy();
+                    radarChart = null;
+                }
+                if (barChart) {
+                    barChart.destroy();
+                    barChart = null;
+                }
+                renderChartFallbackMessage('radarChart', '图表库加载失败，已跳过图表渲染');
+                renderChartFallbackMessage('barChart', '图表库加载失败，已跳过图表渲染');
+                return;
+            }
             
             // 雷达图
             if (radarChart) radarChart.destroy();
@@ -1308,7 +1395,7 @@
                 tempCanvas.height = canvasHeight;
                 const tempCtx = tempCanvas.getContext('2d');
                 tempCtx.fillStyle = '#000000';
-                tempCanvas.fillRect(0, 0, canvasWidth, canvasHeight);
+                tempCtx.fillRect(0, 0, canvasWidth, canvasHeight);
                 fluorescentImageData = tempCtx.getImageData(0, 0, canvasWidth, canvasHeight);
             } else {
                 // 重新生成荧光层
@@ -1482,6 +1569,13 @@
                 alert('请先分析一张图像');
                 return;
             }
+            if (fluorescentInFlight) {
+                return;
+            }
+            if (fluorescentDebounceTimer) {
+                clearTimeout(fluorescentDebounceTimer);
+                fluorescentDebounceTimer = null;
+            }
             
             // 获取选中的标记物
             const checkboxes = document.querySelectorAll('.marker-checkbox:checked');
@@ -1513,7 +1607,7 @@
             fluorescentInFlight = true;
             
             try {
-                const response = await fetch('/generate_fluorescent', {
+                const data = await fetchJsonWithTimeout('/generate_fluorescent', {
                     method: 'POST',
                     headers: {'Content-Type': 'application/json'},
                     body: JSON.stringify({
@@ -1529,9 +1623,7 @@
                         background_noise_sigma: backgroundNoiseSigma,
                         noise_seed: noiseSeed
                     })
-                });
-                
-                const data = await response.json();
+                }, 300000);
                 
                 if (!data.success) {
                     throw new Error(data.error);

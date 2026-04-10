@@ -32,6 +32,42 @@ app = Flask(__name__)
 app.config["TEMPLATES_AUTO_RELOAD"] = True
 app.config["SEND_FILE_MAX_AGE_DEFAULT"] = 0
 
+WEBAPP_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = WEBAPP_DIR.parent
+STATIC_DIR = WEBAPP_DIR / "static"
+TEMP_DIR = STATIC_DIR / "temp"
+SAMPLE_DIR = PROJECT_ROOT / "lung_cancer_organoid_HE"
+BRIDGE_OUT_DIR = PROJECT_ROOT / "bridge_out_web"
+
+
+def _get_default_hex_checkpoint_path() -> Path:
+    candidates = [
+        PROJECT_ROOT / "HEX" / "checkpoint.pth",
+        PROJECT_ROOT / "checkpoint.pth",
+        PROJECT_ROOT / "hex" / "checkpoint.pth",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+def _resolve_project_path(path_value: str | os.PathLike) -> Path:
+    path = Path(path_value).expanduser()
+    if not path.is_absolute():
+        path = PROJECT_ROOT / path
+    return path.resolve()
+
+
+def _to_project_relative_path(path_value: str | os.PathLike | None) -> str | None:
+    if path_value is None:
+        return None
+    path = Path(path_value).resolve()
+    try:
+        return str(path.relative_to(PROJECT_ROOT))
+    except ValueError:
+        return str(path)
+
 # 全局变量存储模型
 model = None
 device = None
@@ -78,7 +114,7 @@ def load_models(hex_ckpt_path: str | None = None):
         model = CustomModel(visual_output_dim=1024, num_outputs=40)
 
         if hex_ckpt_path is None:
-            hex_ckpt_path = "/home/acproject/workspace/python_projects/HEX/hex/checkpoint.pth"
+            hex_ckpt_path = str(_get_default_hex_checkpoint_path())
 
         if os.path.exists(hex_ckpt_path):
             print(f"加载HEX checkpoint: {hex_ckpt_path}")
@@ -450,13 +486,12 @@ def generate_attention_map(img_tensor, features):
 def index():
     """主页"""
     # 获取示例图片列表
-    sample_dir = Path('/home/acproject/workspace/python_projects/HEX/lung_cancer_organoid_HE')
     sample_images = []
-    if sample_dir.exists():
-        for f in sample_dir.glob('*.tif'):
+    if SAMPLE_DIR.exists():
+        for f in SAMPLE_DIR.glob('*.tif'):
             sample_images.append({
                 'name': f.name,
-                'path': str(f)
+                'path': _to_project_relative_path(f)
             })
     
     resp = make_response(render_template('index.html', sample_images=sample_images))
@@ -475,6 +510,11 @@ def serve_static(filename):
     return resp
 
 
+@app.route('/favicon.ico')
+def favicon():
+    return make_response("", 204)
+
+
 @app.route('/analyze', methods=['POST'])
 def analyze():
     """分析图像"""
@@ -485,22 +525,24 @@ def analyze():
         saved_path = None
         
         # 获取图像
+        json_data = request.get_json(silent=True) or {}
+
         if 'file' in request.files:
             file = request.files['file']
             img = Image.open(file.stream).convert('RGB')
             
             # 保存上传的文件到临时目录（用于荧光层生成）
-            import tempfile
-            temp_dir = Path('/home/acproject/workspace/python_projects/HEX/webapp/static/temp')
-            temp_dir.mkdir(exist_ok=True)
-            temp_path = temp_dir / f"temp_{np.random.randint(100000)}.png"
+            TEMP_DIR.mkdir(parents=True, exist_ok=True)
+            temp_path = TEMP_DIR / f"temp_{np.random.randint(100000)}.png"
             img.save(temp_path)
-            saved_path = str(temp_path)
+            saved_path = _to_project_relative_path(temp_path)
             
-        elif 'image_path' in request.json:
-            img_path = request.json['image_path']
+        elif json_data.get('image_path'):
+            img_path = _resolve_project_path(json_data['image_path'])
+            if not img_path.exists():
+                raise FileNotFoundError(f"图像不存在: {img_path}")
             img = Image.open(img_path).convert('RGB')
-            saved_path = img_path
+            saved_path = _to_project_relative_path(img_path)
         else:
             return jsonify({'error': '未提供图像'}), 400
         
@@ -574,12 +616,10 @@ def batch_analyze():
         load_models()
         
         results = []
-        sample_dir = Path('/home/acproject/workspace/python_projects/HEX/lung_cancer_organoid_HE')
-        
-        if not sample_dir.exists():
+        if not SAMPLE_DIR.exists():
             return jsonify({'error': '示例图片目录不存在'}), 400
         
-        for img_path in sorted(sample_dir.glob('*.tif'))[:4]:  # 限制4张
+        for img_path in sorted(SAMPLE_DIR.glob('*.tif'))[:4]:  # 限制4张
             try:
                 img = Image.open(img_path).convert('RGB')
                 
@@ -1290,13 +1330,20 @@ def generate_fluorescent():
         seg_dilate = int(data.get('seg_dilate', 20))
         seg_min_size = int(data.get('seg_min_size', 64))
 
+        if not image_path:
+            raise ValueError("缺少 image_path")
+
+        resolved_image_path = _resolve_project_path(image_path)
+        if not resolved_image_path.exists():
+            raise FileNotFoundError(f"图像不存在: {resolved_image_path}")
+
         if mode == "hex" and (output_dir is None or str(output_dir).strip() == ""):
-            output_dir = "/home/acproject/workspace/python_projects/HEX/bridge_out_web"
+            output_dir = str(BRIDGE_OUT_DIR)
         
         saved_files = None
 
         # 加载图像
-        img = Image.open(image_path).convert('RGB')
+        img = Image.open(resolved_image_path).convert('RGB')
         original_size = img.size
         
         max_display_size = 800
@@ -1307,6 +1354,17 @@ def generate_fluorescent():
         else:
             img_display = img
             display_size = original_size
+
+        display_tissue_mask = _compute_tissue_mask(img_display, white_thresh=0.92)
+        display_cell_mask = None
+        if segmentation_mode == "weak":
+            display_cell_mask = _compute_cell_mask_weak(
+                img_display,
+                tissue_mask=display_tissue_mask,
+                dilate_radius=seg_dilate,
+                min_size=seg_min_size,
+            )
+        combined_mask = display_cell_mask if display_cell_mask is not None else display_tissue_mask
 
         max_infer_size = 4096
         if max(original_size) > max_infer_size:
@@ -1371,17 +1429,6 @@ def generate_fluorescent():
                 fluorescent_only = fluorescent_only.resize(display_size, Image.LANCZOS)
                 per_marker_images_pil = {m: im.resize(display_size, Image.LANCZOS) for m, im in per_marker_images_pil.items()}
 
-            tissue_mask = _compute_tissue_mask(img_display, white_thresh=0.92)
-            cell_mask = None
-            if segmentation_mode == "weak":
-                cell_mask = _compute_cell_mask_weak(
-                    img_display,
-                    tissue_mask=tissue_mask,
-                    dilate_radius=seg_dilate,
-                    min_size=seg_min_size,
-                )
-            combined_mask = cell_mask if cell_mask is not None else tissue_mask
-
             fluorescent_only = _apply_psf_and_noise_rgb(
                 fluorescent_only,
                 psf_sigma=psf_sigma,
@@ -1404,10 +1451,10 @@ def generate_fluorescent():
                 fluorescent_only,
                 alpha_floor=transparent_alpha_floor,
                 alpha_gamma=1.0,
-                alpha_mask=tissue_mask,
+                alpha_mask=combined_mask,
             )
             per_marker_images_pil = {
-                m: _rgb_black_to_transparent_rgba(im, alpha_floor=transparent_alpha_floor, alpha_gamma=1.0, alpha_mask=tissue_mask)
+                m: _rgb_black_to_transparent_rgba(im, alpha_floor=transparent_alpha_floor, alpha_gamma=1.0, alpha_mask=combined_mask)
                 for m, im in per_marker_images_pil.items()
             }
 
@@ -1418,10 +1465,9 @@ def generate_fluorescent():
             import predict_he_to_codex_h5 as hex_h5  # type: ignore
 
             if output_dir:
-                out_root = Path(output_dir).expanduser().resolve()
-                project_root = Path("/home/acproject/workspace/python_projects/HEX").resolve()
-                if project_root not in out_root.parents and out_root != project_root:
-                    raise ValueError("output_dir must be inside /home/acproject/workspace/python_projects/HEX")
+                out_root = _resolve_project_path(output_dir)
+                if PROJECT_ROOT not in out_root.parents and out_root != PROJECT_ROOT:
+                    raise ValueError(f"output_dir must be inside {PROJECT_ROOT}")
                 out_root.mkdir(parents=True, exist_ok=True)
                 run_dir = out_root
                 managed_tmp = None
@@ -1430,7 +1476,7 @@ def generate_fluorescent():
                 run_dir = Path(managed_tmp.name)
 
             try:
-                name = str(job_id).strip() if job_id else Path(image_path).stem
+                name = str(job_id).strip() if job_id else resolved_image_path.stem
                 if not name:
                     name = uuid.uuid4().hex
 
@@ -1477,11 +1523,11 @@ def generate_fluorescent():
 
                 hex_h5.h5_to_grid_npy(tmp_h5, tmp_npy)
                 saved_files = {
-                    "pred_h5": str(tmp_h5),
-                    "codex_npy": str(tmp_npy),
-                    "fluorescent_overlay_png": str(overlay_path),
-                    "fluorescent_only_png": str(fl_only_path),
-                    "marker_dir": str(marker_dir),
+                    "pred_h5": _to_project_relative_path(tmp_h5),
+                    "codex_npy": _to_project_relative_path(tmp_npy),
+                    "fluorescent_overlay_png": _to_project_relative_path(overlay_path),
+                    "fluorescent_only_png": _to_project_relative_path(fl_only_path),
+                    "marker_dir": _to_project_relative_path(marker_dir),
                 }
 
                 with h5py.File(str(tmp_h5), "r") as f:
@@ -1593,7 +1639,7 @@ if __name__ == '__main__':
     parser.add_argument("--offline", action="store_true")
     parser.add_argument("--input", default=None)
     parser.add_argument("--output_dir", default=None)
-    parser.add_argument("--hex_ckpt", default="/home/acproject/workspace/python_projects/HEX/hex/checkpoint.pth")
+    parser.add_argument("--hex_ckpt", default=str(_get_default_hex_checkpoint_path()))
     parser.add_argument("--patch_size", type=int, default=224)
     parser.add_argument("--stride", type=int, default=112)
     parser.add_argument("--alpha", type=float, default=0.6)
